@@ -20,7 +20,8 @@ The project focuses on developing and simulating a control system that utilizes 
 ## 📸 Screenshots
 
 ### Simulation Interface
-![Simulation View](path/to/your/screenshot1.png)
+![Simulation View](<img width="468" height="264" alt="image" src="https://github.com/user-attachments/assets/ac50a0ac-1feb-400b-804e-e59e774a20e3" />
+)
 *Figure 1: Visualization of the UAV flight path generation.*
 
 ### Genetic Algorithm Performance
