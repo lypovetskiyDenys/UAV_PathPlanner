@@ -36,6 +36,9 @@ The project focuses on developing and simulating a control system that utilizes 
 
 *Figure 4: Performance*
 
+<img width="2084" height="1309" alt="image" src="https://github.com/user-attachments/assets/13315b73-b0c4-4bc4-a909-b792bb9aed23" />
+
+*Figure 5: Trajectory*
 
 ### Genetic Algorithm Performance
 ![GA Graphs](path/to/your/screenshot2.png)
