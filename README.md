@@ -44,6 +44,14 @@ The project focuses on developing and simulating a control system that utilizes 
 
 *Figure 6: Statistics*
 
+<img width="419" height="1430" alt="image" src="https://github.com/user-attachments/assets/daeccadf-49e4-4312-9632-cb946527577d" />
+
+*Figure 7: Control Menu*
+
+
+
+
+
 ### Genetic Algorithm Performance
 ![GA Graphs](path/to/your/screenshot2.png)
 *Figure 4: Convergence graph showing fitness score improvement over generations.*
