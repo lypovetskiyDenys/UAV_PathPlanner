@@ -54,8 +54,11 @@ The project focuses on developing and simulating a control system that utilizes 
 
 Otput:
 [01:01:19] Starting GA: pop=100, gens=200, strategy=Convergence (GaCPo)
+
 [01:01:33] Gen 5: cost=63532.1, coll=2
+
 [01:01:33] Gen 10: First collision-free solution found!
+
 [01:01:35] Gen 10: improved by 47264.2 -> cost=16267.9
 [01:01:37] Gen 15: improved by 3684.4 -> cost=12583.5
 [01:01:40] Gen 20: improved by 4355.2 -> cost=8228.3
@@ -70,12 +73,15 @@ Otput:
 [01:02:01] Gen 65: improved by 132.6 -> cost=4214.2
 [01:02:11] Gen 85: improved by 256.1 -> cost=3958.1
 [01:02:16] Gen 95: improved by 214.8 -> cost=3743.4
+
 [01:02:21] Gen 105: improved by 200.0 -> cost=3543.4
 [01:02:32] Gen 125: improved by 29.2 -> cost=3514.2
 [01:02:46] Gen 150: improved by 149.2 -> cost=3365.0
 [01:03:00] Gen 175: improved by 69.9 -> cost=3295.1
 [01:03:09] Gen 190: improved by 6.8 -> cost=3288.4
+
 [01:03:16] GA finished! Final cost=3288.37, collisions=0
+
 [01:03:16] Path smoothed with 200 points
 
 ### Genetic Algorithm Performance
