@@ -1,0 +1,2593 @@
+"""
+UAV Genetic Algorithm Path Planner 
+
+This program implements a 3D path planner for a UAV using Genetic Algorithms (GA)
+inspired by the GaLM / GaHM / GaCPo strategies from:
+
+Key ideas implemented:
+- Waypoint-based chromosome in continuous 3D space
+- Multi-term fitness: path length + collision penalties + near-obstacle penalties
+- High-mutation strategy with a convergence (elite) sub-population
+- Repopulation when the GA stagnates (to regain diversity)
+- Injection of a direct start→goal individual in each generation
+- Static or dynamic spherical obstacles
+Thesis / teaching-oriented extensions:
+- GUI to select GA strategy and parameters
+- GUI controls for choosing START and GOAL coordinates inside the 3D world
+- Live plots: 3D path, 2D projections, fitness & collisions vs generation,
+  and time-parametrised reference trajectory X(t), Y(t), Z(t)
+- Status label and console logging so you can see what the GA is doing
+  "under the hood" while it runs.
+
+This file is designed to be readable by another developer: classes are
+separated by responsibility (environment, GA planner, worker thread, GUI)
+and key methods are documented.
+"""
+
+import sys
+import math
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+import numpy as np
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLabel,
+    QCheckBox,
+    QSpinBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QMessageBox,
+    QTabWidget,
+    QComboBox,
+    QProgressBar,
+    QTextEdit,
+    QGroupBox,
+)
+
+# --- Matplotlib setup for PyQt6 ---
+import matplotlib
+
+matplotlib.use("QtAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (ensures "3d" projection is registered)
+from matplotlib.lines import Line2D
+
+from scipy.interpolate import splprep, splev
+
+
+# ======================================================================
+# GA CONFIGURATION
+# ======================================================================
+
+
+@dataclass
+class PlannerConfig:
+    """Central configuration for the GA planner, environment and UAV model.
+
+    This dataclass consolidates all tunable parameters for the genetic algorithm,
+    environment bounds, fitness function weights, and visualization settings.
+    Parameters can be adjusted via the GUI or modified directly for batch experiments.
+
+    Attributes
+    ----------
+    Environment Bounds:
+        min_x, max_x : float
+            X-axis bounds of the 3D environment (default: 0-100 meters).
+        min_y, max_y : float
+            Y-axis bounds of the 3D environment (default: 0-100 meters).
+        min_z, max_z : float
+            Z-axis (altitude) bounds (default: 0-100 meters).
+
+    Mission Parameters:
+        start : Tuple[float, float, float]
+            Starting position (x, y, z) for the UAV mission.
+        goal : Tuple[float, float, float]
+            Target position (x, y, z) for the UAV mission.
+
+    GA Parameters:
+        population_size : int
+            Number of individuals in the population.
+        num_generations : int
+            Maximum number of GA iterations.
+        num_waypoints : int
+            Number of intermediate waypoints per path (chromosome length).
+        crossover_rate : float
+            Probability of applying crossover to parent pairs.
+        mutation_rate : float
+            Probability of mutating each waypoint.
+        mutation_sigma : float
+            Standard deviation for Gaussian mutation perturbation.
+        strategy : str
+            GA variant: "Standard (GaLM)", "High mutation (GaHM)", or "Convergence (GaCPo)".
+
+    Fitness Weights:
+        w_length : float
+            Weight for path length in fitness calculation.
+        w_safety : float
+            Weight for obstacle proximity penalties.
+        w_smoothness : float
+            Weight for path curvature (smoothness) cost.
+        w_energy : float
+            Weight for energy consumption (altitude changes + turns).
+
+    Penalty Values:
+        collision_penalty : float
+            Penalty per path segment that intersects an obstacle.
+        waypoint_inside_penalty : float
+            Penalty for waypoints located inside an obstacle.
+        near_obstacle_penalty : float
+            Penalty for waypoints within `near_obstacle_distance` of an obstacle.
+        near_obstacle_distance : float
+            Distance threshold (meters) for "near obstacle" penalty.
+
+    Obstacle Configuration:
+        obstacle_count : int
+            Number of spherical obstacles to generate.
+        obstacle_min_radius, obstacle_max_radius : float
+            Range for random obstacle radii.
+        dynamic_obstacles : bool
+            Enable obstacle movement during optimization.
+        obstacle_move_interval : int
+            Generations between obstacle position updates.
+        obstacle_move_amount : float
+            Maximum displacement per obstacle move.
+
+    GaCPo Strategy Parameters:
+        elite_fraction : float
+            Fraction of population protected from mutation.
+        stagnation_generations : int
+            Generations without improvement before repopulation.
+        repopulation_fraction : float
+            Fraction of population replaced on stagnation.
+
+    Algorithm Constants:
+        tournament_size : int
+            Number of individuals in tournament selection.
+        trajectory_samples : int
+            Number of points for spline interpolation.
+        sphere_render_resolution : int
+            Resolution for 3D sphere rendering.
+        numerical_epsilon : float
+            Small value for numerical stability.
+    """
+
+    # --- 1. Простір (Імітуємо політ над складною ділянкою 200x200м) ---
+    min_x: float = 0.0
+    max_x: float = 200.0
+    min_y: float = 0.0
+    max_y: float = 200.0
+    min_z: float = 0.0
+    max_z: float = 100.0 # Висота до 100м
+
+    # --- 2. Місія (Діагональний переліт з набором висоти - "зліт з точки А в точку Б") ---
+    start: Tuple[float, float, float] = (10.0, 10.0, 5.0)   # Низький старт
+    goal: Tuple[float, float, float] = (180.0, 180.0, 60.0) # Висока ціль
+
+    # --- 3. Генетичний Алгоритм (Налаштування для стабільної збіжності) ---
+    population_size: int = 100       # Більша популяція для кращого пошуку
+    num_generations: int = 200       # Достатньо для демо (не змушує чекати вічність)
+    num_waypoints: int = 12          # Більше точок для огинання складних перешкод
+    crossover_rate: float = 0.85
+    mutation_rate: float = 0.25      # Трохи вища мутація, щоб виходити з локальних мінімумів
+    mutation_sigma: float = 15.0     # Ширший крок пошуку на старті
+
+    strategy: str = "Convergence (GaCPo)"
+
+    # --- 4. Вагова функція (Створюємо "Акуратного пілота") ---
+    w_length: float = 1.0       # Економія батареї (шлях)
+    w_safety: float = 3.5       # ПРІОРИТЕТ: Безпека понад усе (уникати "No-Fly Zones")
+    w_smoothness: float = 2.0   # Плавність польоту (важливо для відеозйомки/сенсорів)
+    w_energy: float = 1.5       # Штраф за різкі набори висоти
+
+    # --- 5. Параметри штрафів ---
+    altitude_change_cost: float = 3.0
+    descent_cost_factor: float = 0.5
+    turn_cost: float = 2.0
+
+    collision_penalty: float = 5000.0      # Критичний штраф за аварію
+    waypoint_inside_penalty: float = 2000.0
+    near_obstacle_penalty: float = 100.0
+    near_obstacle_distance: float = 5.0    # Тримати дистанцію 5 метрів від об'єктів
+
+    # --- 6. Середовище (Щільне поле перешкод) ---
+    obstacle_count: int = 25               # Більше перешкод!
+    obstacle_min_radius: float = 8.0       # Великі об'єкти
+    obstacle_max_radius: float = 25.0
+
+    dynamic_obstacles: bool = False        # Для демо краще статика, щоб пояснювати шлях
+    obstacle_move_interval: int = 10
+    obstacle_move_amount: float = 4.0
+
+    elite_fraction: float = 0.15
+    stagnation_generations: int = 30
+    repopulation_fraction: float = 0.4
+
+    update_interval: int = 5
+    uav_speed: float = 12.0                # Реалістична крейсерська швидкість (м/с)
+
+    tournament_size: int = 5
+    trajectory_samples: int = 500          # Гладша лінія на графіках
+    sphere_render_resolution: int = 20     # Красивіші кулі
+    numerical_epsilon: float = 1e-9
+
+# ======================================================================
+# ENVIRONMENT MODEL
+# ======================================================================
+
+
+class Environment:
+    """3D environment with spherical obstacles and collision checking.
+
+    This class manages the physical world in which the UAV operates,
+    including obstacle placement, movement (for dynamic scenarios),
+    and collision detection between path segments and obstacles.
+
+    Obstacles are stored as tuples of (x, y, z, radius). For dynamic
+    obstacles, each has an associated random direction vector that
+    gets reflected when the obstacle hits the world bounds.
+
+    Attributes
+    ----------
+    config : PlannerConfig
+        Reference to the configuration object.
+    obstacles : List[Tuple[float, float, float, float]]
+        List of obstacles as (center_x, center_y, center_z, radius).
+    _dyn_dirs : List[np.ndarray]
+        Direction vectors for dynamic obstacle movement.
+
+    Methods
+    -------
+    randomize_obstacles(count)
+        Generate a new random set of spherical obstacles.
+    move_obstacles()
+        Update obstacle positions (for dynamic environments).
+    count_path_collisions(path)
+        Count obstacles that intersect with a polyline path.
+    waypoint_obstacle_cost(wp, cfg)
+        Calculate penalty for a waypoint based on obstacle proximity.
+    """
+
+    def __init__(self, config: PlannerConfig):
+        self.config = config
+        self.obstacles: List[Tuple[float, float, float, float]] = []
+        self._dyn_dirs: List[np.ndarray] = []
+
+    # ------------------------- obstacle management ------------------------- #
+
+    def randomize_obstacles(self, count: int) -> None:
+        """Create a new random set of spherical obstacles.
+
+        Generates `count` spherical obstacles with random positions and radii
+        within the environment bounds. Each obstacle is placed such that it
+        remains fully inside the world boundaries.
+
+        Parameters
+        ----------
+        count : int
+            Number of obstacles to generate.
+        """
+        self.obstacles.clear()
+        cfg = self.config
+        for _ in range(count):
+            r = float(
+                np.random.uniform(cfg.obstacle_min_radius, cfg.obstacle_max_radius)
+            )
+            x = float(np.random.uniform(cfg.min_x + r, cfg.max_x - r))
+            y = float(np.random.uniform(cfg.min_y + r, cfg.max_y - r))
+            z = float(np.random.uniform(cfg.min_z + r, cfg.max_z - r))
+            self.obstacles.append((x, y, z, r))
+        self._dyn_dirs = [self._random_unit_vector() for _ in self.obstacles]
+
+    def _random_unit_vector(self) -> np.ndarray:
+        """Generate a random 3D unit vector."""
+        theta = np.random.uniform(0, 2 * math.pi)
+        phi = np.random.uniform(0, math.pi)
+        vx = math.sin(phi) * math.cos(theta)
+        vy = math.sin(phi) * math.sin(theta)
+        vz = math.cos(phi)
+        v = np.array([vx, vy, vz], dtype=float)
+        return v / (np.linalg.norm(v) + self.config.numerical_epsilon)
+
+    def move_obstacles(self) -> None:
+        """Move obstacles along their direction vectors, reflecting at bounds.
+
+        Each obstacle moves a random distance (up to `obstacle_move_amount`)
+        along its direction vector. When an obstacle would exit the world
+        bounds, its direction is reflected (bounced) to keep it inside.
+
+        This method only has effect when `config.dynamic_obstacles` is True.
+        """
+        if not self.config.dynamic_obstacles or not self.obstacles:
+            return
+        cfg = self.config
+        moved = []
+        for i, (x, y, z, r) in enumerate(self.obstacles):
+            d = self._dyn_dirs[i]
+            dist = np.random.uniform(0.0, cfg.obstacle_move_amount)
+            nx, ny, nz = x + d[0] * dist, y + d[1] * dist, z + d[2] * dist
+
+            # bounce on borders
+            if nx - r < cfg.min_x or nx + r > cfg.max_x:
+                d[0] *= -1
+                nx = min(max(nx, cfg.min_x + r), cfg.max_x - r)
+            if ny - r < cfg.min_y or ny + r > cfg.max_y:
+                d[1] *= -1
+                ny = min(max(ny, cfg.min_y + r), cfg.max_y - r)
+            if nz - r < cfg.min_z or nz + r > cfg.max_z:
+                d[2] *= -1
+                nz = min(max(nz, cfg.min_z + r), cfg.max_z - r)
+
+            self._dyn_dirs[i] = d
+            moved.append((nx, ny, nz, r))
+        self.obstacles = moved
+
+    # ---------------------------- cost helpers ---------------------------- #
+
+    def count_path_collisions(self, path: List[Tuple[float, float, float]]) -> int:
+        """
+        Count how many obstacles intersect with the polyline path (line-vs-sphere).
+        This corresponds to criterion 3 in the paper (sum of path crossings),
+        but we implement it in 3D directly as segment/sphere intersection tests.
+        """
+        if not self.obstacles or len(path) < 2:
+            return 0
+
+        pts = np.array(path, dtype=float)
+        A = pts[:-1]
+        B = pts[1:]
+        AB = B - A
+        AB2 = np.sum(AB * AB, axis=1) + self.config.numerical_epsilon
+
+        collisions = 0
+        for ox, oy, oz, r in self.obstacles:
+            center = np.array([ox, oy, oz], dtype=float)
+            t = np.sum((center - A) * AB, axis=1) / AB2
+            t = np.clip(t, 0.0, 1.0)
+            closest = A + t[:, None] * AB
+            d2 = np.sum((center - closest) ** 2, axis=1)
+            if np.any(d2 <= r**2):
+                collisions += 1
+        return collisions
+
+    def waypoint_obstacle_cost(
+        self, wp: Tuple[float, float, float], cfg: PlannerConfig
+    ) -> float:
+        """
+        Penalise waypoints that are inside or very close to obstacles.
+
+        - If distance <= radius  -> inside obstacle -> large penalty.
+        - Else if distance <= radius + near_distance -> near obstacle -> smaller penalty.
+        """
+        if not self.obstacles:
+            return 0.0
+
+        wx, wy, wz = wp
+        cost = 0.0
+        for ox, oy, oz, r in self.obstacles:
+            d = math.sqrt((wx - ox) ** 2 + (wy - oy) ** 2 + (wz - oz) ** 2)
+            if d <= r:
+                cost += cfg.waypoint_inside_penalty
+            elif d <= r + cfg.near_obstacle_distance:
+                cost += cfg.near_obstacle_penalty
+        return cost
+
+
+# ======================================================================
+# GENETIC PLANNER
+# ======================================================================
+
+
+class GeneticPlanner:
+    """Waypoint-based genetic algorithm path planner.
+
+    This class implements a genetic algorithm for finding optimal UAV flight
+    paths through a 3D environment with obstacles. Each individual (chromosome)
+    is a list of 3D waypoints, and the full path includes start and goal points.
+
+    The fitness function combines four weighted components:
+    1. **Path length**: Total Euclidean distance (minimize)
+    2. **Safety**: Penalties for waypoints near/inside obstacles + collision count
+    3. **Smoothness**: Second-derivative based curvature cost
+    4. **Energy**: Altitude change costs (climbing expensive) + turn angle costs
+
+    The GA supports three strategies:
+    - **GaLM (Standard)**: Basic GA with low mutation
+    - **GaHM (High Mutation)**: Aggressive exploration with high mutation
+    - **GaCPo (Convergence)**: Elite protection + stagnation-triggered repopulation
+
+    Attributes
+    ----------
+    config : PlannerConfig
+        Algorithm and environment configuration.
+    env : Environment
+        Reference to the obstacle environment.
+    population : List[List[Tuple[float, float, float]]]
+        Current population of chromosomes (waypoint lists).
+    best_path : List[Tuple[float, float, float]]
+        Best path found so far (including start/goal).
+    best_cost : float
+        Fitness value of the best path.
+    best_collisions : int
+        Number of collisions in the best path.
+    best_breakdown : dict
+        Cost breakdown of the best path (length, safety, smoothness, energy).
+    best_cost_history : List[float]
+        History of best costs per generation.
+    collisions_history : List[int]
+        History of collision counts per generation.
+    breakdown_history : List[dict]
+        History of cost breakdowns per generation.
+    diversity_history : List[float]
+        History of population diversity (fitness std dev) per generation.
+
+    Methods
+    -------
+    run_generation()
+        Execute one GA iteration (selection, crossover, mutation).
+    smooth_path(raw_path, num_samples)
+        Apply B-spline smoothing to a path.
+    generate_time_parametrised_trajectory(path, speed, num_samples)
+        Create time-parametrized trajectory from geometric path.
+    """
+
+    def __init__(self, config: PlannerConfig, env: Environment):
+        self.config = config
+        self.env = env
+
+        self.population: List[List[Tuple[float, float, float]]] = []
+        self.best_path: List[Tuple[float, float, float]] = []
+        self.best_cost: float = float("inf")
+        self.best_collisions: int = 0
+        self.best_breakdown: dict = {
+            "length": 0.0,
+            "safety": 0.0,
+            "smoothness": 0.0,
+            "energy": 0.0,
+        }
+
+        self.best_cost_history: List[float] = []
+        self.collisions_history: List[int] = []
+        self.breakdown_history: List[dict] = []
+        self.diversity_history: List[float] = []
+
+        self._stagnation_counter: int = 0
+
+        self._init_population_from_strategy()
+
+    # --------------------------- initialisation --------------------------- #
+
+    def _init_population_from_strategy(self) -> None:
+        """Create initial population and tune mutation parameters based on GA strategy.
+
+        This method configures mutation parameters according to the selected
+        strategy and generates the initial random population. It also performs
+        initial fitness evaluation to set the starting best solution.
+
+        Strategy configurations:
+        - Standard (GaLM): mutation_rate=0.1, mutation_sigma=4.0
+        - High mutation (GaHM): mutation_rate=0.3, mutation_sigma=8.0
+        - Convergence (GaCPo): Same as GaHM + elite_fraction=0.25,
+          repopulation_fraction=0.5, stagnation_generations=15
+        """
+        cfg = self.config
+
+        if cfg.strategy.startswith("Standard"):
+            cfg.mutation_rate = 0.1
+            cfg.mutation_sigma = 4.0
+        elif cfg.strategy.startswith("High"):
+            cfg.mutation_rate = 0.3
+            cfg.mutation_sigma = 8.0
+        elif cfg.strategy.startswith("Convergence"):
+            cfg.mutation_rate = 0.3
+            cfg.mutation_sigma = 8.0
+            cfg.elite_fraction = 0.25
+            cfg.repopulation_fraction = 0.5
+            cfg.stagnation_generations = 15
+
+        self.population.clear()
+        for _ in range(cfg.population_size):
+            self.population.append(self._random_individual())
+
+        # evaluate once to set initial best
+        for indiv in self.population:
+            c, coll, breakdown = self._evaluate(indiv)
+            if c < self.best_cost:
+                self.best_cost = c
+                self.best_collisions = coll
+                self.best_path = self._full_path(indiv)
+                self.best_breakdown = breakdown
+
+        self.best_cost_history.append(self.best_cost)
+        self.collisions_history.append(self.best_collisions)
+
+    def _random_individual(self) -> List[Tuple[float, float, float]]:
+        """Create a random list of waypoints inside bounds."""
+        cfg = self.config
+        indiv = []
+        for _ in range(cfg.num_waypoints):
+            x = float(np.random.uniform(cfg.min_x, cfg.max_x))
+            y = float(np.random.uniform(cfg.min_y, cfg.max_y))
+            z = float(np.random.uniform(cfg.min_z, cfg.max_z))
+            indiv.append((x, y, z))
+        return indiv
+
+    def _full_path(
+        self, indiv: List[Tuple[float, float, float]]
+    ) -> List[Tuple[float, float, float]]:
+        """Add start/goal to the waypoint list."""
+        return [self.config.start] + indiv + [self.config.goal]
+
+    # ------------------------------- fitness ------------------------------ #
+
+    def _compute_smoothness_cost(self, path: List[Tuple[float, float, float]]) -> float:
+        """
+        Compute smoothness cost using second derivative (curvature approximation).
+        Lower = smoother path.
+
+        Formula: Σ |p[i+1] - 2*p[i] + p[i-1]|²
+        """
+        if len(path) < 3:
+            return 0.0
+        pts = np.array(path, dtype=float)
+        # Second derivative approximation
+        d2 = pts[2:] - 2 * pts[1:-1] + pts[:-2]
+        return float(np.sum(d2**2))
+
+    def _compute_energy_cost(self, path: List[Tuple[float, float, float]]) -> float:
+        """
+        Compute energy cost based on altitude changes and turns.
+        Climbing is more expensive than descending.
+
+        Energy = altitude_cost * Σ max(Δz, 0) + descent_factor * Σ|min(Δz, 0)| + turn_cost * Σ|θ|
+        """
+        if len(path) < 2:
+            return 0.0
+
+        cfg = self.config
+        pts = np.array(path, dtype=float)
+
+        # Altitude changes (climbing more expensive)
+        dz = pts[1:, 2] - pts[:-1, 2]
+        climb_cost = float(np.sum(np.maximum(dz, 0))) * cfg.altitude_change_cost
+        descent_cost = (
+            float(np.sum(np.abs(np.minimum(dz, 0)))) * cfg.descent_cost_factor
+        )
+        altitude_energy = climb_cost + descent_cost
+
+        # Turn cost (angle between consecutive segments)
+        if len(path) < 3:
+            return altitude_energy
+
+        seg = pts[1:] - pts[:-1]
+        seg_lengths = np.linalg.norm(seg, axis=1, keepdims=True)
+        seg_norm = seg / (seg_lengths + cfg.numerical_epsilon)
+        # Dot product of consecutive normalized segments
+        dots = np.sum(seg_norm[:-1] * seg_norm[1:], axis=1)
+        dots = np.clip(dots, -1.0, 1.0)
+        angles = np.arccos(dots)  # Radians
+        turn_energy = float(np.sum(angles)) * cfg.turn_cost
+
+        return altitude_energy + turn_energy
+
+    def _evaluate(
+        self, indiv: List[Tuple[float, float, float]]
+    ) -> Tuple[float, int, dict]:
+        """
+        Compute cost, collisions, and cost breakdown for an individual.
+
+        Returns
+        -------
+        (total_cost, collisions, breakdown_dict)
+        """
+        cfg = self.config
+        path = self._full_path(indiv)
+        pts = np.array(path, dtype=float)
+        seg = pts[1:] - pts[:-1]
+        seg_len = np.linalg.norm(seg, axis=1)
+        path_length = float(np.sum(seg_len))
+
+        # Safety cost: penalty for waypoints near or inside obstacles
+        wp_cost = 0.0
+        for wp in indiv:
+            wp_cost += self.env.waypoint_obstacle_cost(wp, cfg)
+
+        # Collisions (line vs sphere)
+        collisions = self.env.count_path_collisions(path)
+        coll_cost = collisions * cfg.collision_penalty
+        safety_cost = wp_cost + coll_cost
+
+        # Smoothness cost (second derivative based)
+        smoothness_cost = self._compute_smoothness_cost(path)
+
+        # Energy cost (altitude + turns)
+        energy_cost = self._compute_energy_cost(path)
+
+        # Weighted total
+        total_cost = (
+            cfg.w_length * path_length
+            + cfg.w_safety * safety_cost
+            + cfg.w_smoothness * smoothness_cost
+            + cfg.w_energy * energy_cost
+        )
+
+        # Breakdown for visualization
+        breakdown = {
+            "length": path_length,
+            "safety": safety_cost,
+            "smoothness": smoothness_cost,
+            "energy": energy_cost,
+        }
+
+        return total_cost, collisions, breakdown
+
+    def get_population_diversity(self) -> float:
+        """Return standard deviation of fitness values in current population."""
+        costs = [self._evaluate(ind)[0] for ind in self.population]
+        return float(np.std(costs))
+
+    # ---------------------------- GA operators ---------------------------- #
+
+    def _tournament_selection(
+        self, fitness_cache: List[Tuple[float, int, dict]], k: Optional[int] = None
+    ) -> List[List[Tuple[float, float, float]]]:
+        """
+        Tournament selection using pre-computed fitness values.
+
+        Parameters
+        ----------
+        fitness_cache : list of (cost, collisions, breakdown) tuples, one per individual
+        k : tournament size (defaults to config.tournament_size)
+        """
+        if k is None:
+            k = self.config.tournament_size
+        chosen: List[List[Tuple[float, float, float]]] = []
+        pop = self.population
+        for _ in range(len(pop)):
+            idx = np.random.choice(len(pop), size=min(k, len(pop)), replace=False)
+            best = None
+            best_cost = float("inf")
+            for i in idx:
+                c = fitness_cache[i][0]
+                if c < best_cost:
+                    best_cost = c
+                    best = pop[i]
+            chosen.append(best.copy())  # type: ignore[union-attr]
+        return chosen
+
+    def _crossover(
+        self,
+        p1: List[Tuple[float, float, float]],
+        p2: List[Tuple[float, float, float]],
+    ) -> Tuple[List[Tuple[float, float, float]], List[Tuple[float, float, float]]]:
+        """Single-point crossover on the waypoint list.
+
+        Selects a random crossover point and swaps the waypoints after that
+        point between the two parents to create two offspring.
+
+        Parameters
+        ----------
+        p1 : List[Tuple[float, float, float]]
+            First parent chromosome (list of waypoints).
+        p2 : List[Tuple[float, float, float]]
+            Second parent chromosome.
+
+        Returns
+        -------
+        Tuple[List, List]
+            Two offspring chromosomes.
+        """
+        if len(p1) != len(p2) or len(p1) == 0:
+            return p1.copy(), p2.copy()
+        N = len(p1)
+        cx = np.random.randint(1, N) if N > 1 else 1
+        o1 = p1[:cx] + p2[cx:]
+        o2 = p2[:cx] + p1[cx:]
+        return o1, o2
+
+    def _mutate(self, indiv: List[Tuple[float, float, float]]) -> None:
+        """Apply Gaussian mutation to waypoint positions.
+
+        Each waypoint has a `mutation_rate` probability of being mutated.
+        When mutated, each coordinate (x, y, z) is perturbed by adding
+        a random value from N(0, mutation_sigma). Results are clipped
+        to stay within environment bounds.
+
+        Parameters
+        ----------
+        indiv : List[Tuple[float, float, float]]
+            Chromosome to mutate (modified in place).
+        """
+        cfg = self.config
+        for i in range(len(indiv)):
+            if np.random.rand() < cfg.mutation_rate:
+                x, y, z = indiv[i]
+                x += np.random.normal(0, cfg.mutation_sigma)
+                y += np.random.normal(0, cfg.mutation_sigma)
+                z += np.random.normal(0, cfg.mutation_sigma)
+                x = float(np.clip(x, cfg.min_x, cfg.max_x))
+                y = float(np.clip(y, cfg.min_y, cfg.max_y))
+                z = float(np.clip(z, cfg.min_z, cfg.max_z))
+                indiv[i] = (x, y, z)
+
+    # ------------------------------ main step ----------------------------- #
+
+    def run_generation(self) -> Tuple[float, int, dict, float]:
+        """
+        Run one GA generation (selection + crossover + mutation + repopulation).
+
+        Returns
+        -------
+        (best_cost, best_collisions, best_breakdown, population_diversity)
+        """
+        cfg = self.config
+
+        # Pre-compute fitness for all individuals (avoids repeated evaluation)
+        # Returns list of (cost, collisions, breakdown)
+        fitness_cache: List[Tuple[float, int, dict]] = [
+            self._evaluate(indiv) for indiv in self.population
+        ]
+
+        selected = self._tournament_selection(fitness_cache)
+        new_pop: List[List[Tuple[float, float, float]]] = []
+
+        # 1) Elitism: best individual from current population (using cache)
+        best_idx = min(range(len(fitness_cache)), key=lambda i: fitness_cache[i][0])
+        new_pop.append(self.population[best_idx].copy())
+
+        # 2) Crossover + mutation
+        i = 0
+        while i < len(selected) - 1 and len(new_pop) < cfg.population_size:
+            p1 = selected[i]
+            p2 = selected[i + 1]
+            if np.random.rand() < cfg.crossover_rate:
+                o1, o2 = self._crossover(p1, p2)
+            else:
+                o1, o2 = p1.copy(), p2.copy()
+            new_pop.append(o1)
+            if len(new_pop) < cfg.population_size:
+                new_pop.append(o2)
+            i += 2
+
+        # 3) Fill with random if needed
+        while len(new_pop) < cfg.population_size:
+            new_pop.append(self._random_individual())
+
+        # 4) Mutation with “convergence population” protection
+        if cfg.strategy.startswith("Convergence"):
+            elite_size = max(1, int(cfg.elite_fraction * cfg.population_size))
+            elites = new_pop[:elite_size]
+            rest = new_pop[elite_size:]
+            for indiv in rest:
+                self._mutate(indiv)
+            new_pop = elites + rest
+        else:
+            for indiv in new_pop:
+                self._mutate(indiv)
+
+        # 5) Inject direct straight-line individual (helps convergence)
+        # Place it at the end to avoid overwriting the elite at index 0
+        direct = self._straight_line_individual()
+        new_pop[-1] = direct
+
+        self.population = new_pop
+
+        # 6) Evaluate best of this generation and compute diversity
+        gen_best_cost = float("inf")
+        gen_best_coll = 0
+        gen_best_path = None
+        gen_best_breakdown = None
+        all_costs = []
+
+        for indiv in self.population:
+            c, coll, breakdown = self._evaluate(indiv)
+            all_costs.append(c)
+            if c < gen_best_cost:
+                gen_best_cost = c
+                gen_best_coll = coll
+                gen_best_path = self._full_path(indiv)
+                gen_best_breakdown = breakdown
+
+        # Compute population diversity (std dev of costs)
+        diversity = float(np.std(all_costs)) if all_costs else 0.0
+
+        # 7) Update global best + stagnation counter
+        if gen_best_path is not None and gen_best_cost < self.best_cost:
+            self.best_cost = gen_best_cost
+            self.best_collisions = gen_best_coll
+            self.best_path = gen_best_path
+            self.best_breakdown = (
+                gen_best_breakdown if gen_best_breakdown else self.best_breakdown
+            )
+            self._stagnation_counter = 0
+        else:
+            self._stagnation_counter += 1
+
+        # 8) Repopulate part of population if we have stagnated
+        if (
+            cfg.repopulation_fraction > 0.0
+            and self._stagnation_counter >= cfg.stagnation_generations
+        ):
+            num_replace = int(cfg.repopulation_fraction * cfg.population_size)
+            for i in range(cfg.population_size - num_replace, cfg.population_size):
+                self.population[i] = self._random_individual()
+            self._stagnation_counter = 0
+
+        self.best_cost_history.append(self.best_cost)
+        self.collisions_history.append(self.best_collisions)
+        self.breakdown_history.append(self.best_breakdown.copy())
+        self.diversity_history.append(diversity)
+
+        return self.best_cost, self.best_collisions, self.best_breakdown, diversity
+
+    def _straight_line_individual(self) -> List[Tuple[float, float, float]]:
+        """
+        Construct an individual whose waypoints lie on the straight line from start to goal.
+        Useful to inject into population as a very “structured” candidate.
+        """
+        cfg = self.config
+        s = np.array(cfg.start, dtype=float)
+        g = np.array(cfg.goal, dtype=float)
+        if cfg.num_waypoints <= 0:
+            return []
+        alphas = np.linspace(0, 1, cfg.num_waypoints + 2)[1:-1]
+        indiv = []
+        for a in alphas:
+            p = (1 - a) * s + a * g
+            indiv.append(tuple(map(float, p)))
+        return indiv
+
+    # ------------------------------ smoothing ----------------------------- #
+
+    @staticmethod
+    def smooth_path(
+        raw_path: List[Tuple[float, float, float]],
+        num_samples: int = 200,
+    ) -> List[Tuple[float, float, float]]:
+        """
+        B-spline smoothing of a polyline path.
+
+        In the thesis, this path is the output of the GA and acts as the reference
+        trajectory generator for a lower-level PID / MPC controller.
+
+        Parameters
+        ----------
+        raw_path : list of waypoints
+        num_samples : number of points in smoothed path (default 200)
+        """
+        if len(raw_path) < 3:
+            return raw_path
+        try:
+            pts = np.array(raw_path, dtype=float).T  # shape (3, N)
+            tck, _ = splprep(pts, s=0)
+            u_fine = np.linspace(0, 1, num_samples)
+            spline_result = splev(u_fine, tck)
+            # splev returns a list of arrays; convert to proper typed result
+            result_array = np.array(spline_result, dtype=float).T  # shape (N, 3)
+            return [
+                (float(row[0]), float(row[1]), float(row[2])) for row in result_array
+            ]
+        except Exception as e:
+            print(f"spline smoothing failed: {e}")
+            return raw_path.copy()
+
+    # ------------------------- trajectory generator ----------------------- #
+
+    @staticmethod
+    def generate_time_parametrised_trajectory(
+        path: List[Tuple[float, float, float]],
+        speed: float,
+        num_samples: int = 200,
+        epsilon: float = 1e-9,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Given a geometric path, create a time-parametrised trajectory (t, x(t), y(t), z(t))
+        using constant speed along the arc length (similar to eqs. (22)-(27) in the paper).
+
+        Parameters
+        ----------
+        path : list of waypoints
+        speed : UAV speed in m/s
+        num_samples : number of trajectory samples (default 200)
+        epsilon : numerical stability threshold (default 1e-9)
+        """
+        if len(path) < 2 or speed <= 0:
+            t = np.array([0.0])
+            pts = np.array(path if path else [(0, 0, 0)], dtype=float)
+            return t, pts[:, 0], pts[:, 1], pts[:, 2]
+
+        pts = np.array(path, dtype=float)
+        seg = pts[1:] - pts[:-1]
+        seg_len = np.linalg.norm(seg, axis=1)
+        s = np.concatenate([[0.0], np.cumsum(seg_len)])
+        total_len = s[-1]
+        if total_len < epsilon:
+            t = np.array([0.0])
+            return t, pts[:, 0], pts[:, 1], pts[:, 2]
+
+        total_time = total_len / speed
+        t = np.linspace(0.0, total_time, num_samples)
+        # map times to arc length parameter u in [0, 1]
+        u = t / total_time
+        # simple linear resampling along s
+        xs = np.interp(u * total_len, s, pts[:, 0])
+        ys = np.interp(u * total_len, s, pts[:, 1])
+        zs = np.interp(u * total_len, s, pts[:, 2])
+        return t, xs, ys, zs
+
+
+# ======================================================================
+# WORKER THREAD
+# ======================================================================
+
+
+class GAWorker(QThread):
+    """QThread wrapper that runs the GA in a background thread.
+
+    This class allows the genetic algorithm to run without blocking the
+    GUI, enabling real-time visualization of optimization progress.
+
+    Signals
+    -------
+    progress : pyqtSignal(int, float, int, list, dict, float)
+        Emitted every `update_interval` generations with:
+        (generation, best_cost, collisions, best_path, breakdown, diversity)
+    finished : pyqtSignal(list, float, dict)
+        Emitted when optimization completes with:
+        (final_path, final_cost, final_breakdown)
+
+    Attributes
+    ----------
+    config : PlannerConfig
+        Algorithm configuration.
+    env : Environment
+        Reference to the obstacle environment.
+    _stop : bool
+        Flag to request early termination.
+    """
+
+    # Extended signals with breakdown and diversity data
+    progress = pyqtSignal(
+        int, float, int, list, dict, float
+    )  # gen, best_cost, collisions, best_path, breakdown, diversity
+    finished = pyqtSignal(list, float, dict)  # final_path, final_cost, final_breakdown
+
+    def __init__(self, config: PlannerConfig, env: Environment):
+        super().__init__()
+        self.config = config
+        self.env = env
+        self._stop = False
+
+    def run(self):
+        planner = GeneticPlanner(self.config, self.env)
+        for gen in range(1, self.config.num_generations + 1):
+            if self._stop:
+                break
+
+            # option to move obstacles (dynamic environment)
+            if (
+                self.config.dynamic_obstacles
+                and gen % self.config.obstacle_move_interval == 0
+            ):
+                self.env.move_obstacles()
+
+            _, _, breakdown, diversity = planner.run_generation()
+
+            if (
+                gen % self.config.update_interval == 0
+                or gen == self.config.num_generations
+            ):
+                self.progress.emit(
+                    gen,
+                    planner.best_cost,
+                    planner.best_collisions,
+                    planner.best_path.copy(),
+                    planner.best_breakdown.copy(),
+                    diversity,
+                )
+
+        self.finished.emit(
+            planner.best_path.copy(),
+            float(planner.best_cost),
+            planner.best_breakdown.copy(),
+        )
+
+    def stop(self):
+        self._stop = True
+
+
+# ======================================================================
+# GUI
+# ======================================================================
+
+
+class MainWindow(QMainWindow):
+    """Main PyQt6 application window for the UAV GA Path Planner.
+
+    The window is divided into two main sections:
+    - **Left panel**: Control widgets for configuring GA parameters, environment
+      settings, mission waypoints, and action buttons (Start/Stop/Randomize).
+    - **Right panel**: Tabbed visualization area with 5 tabs:
+      1. 3D Path - Interactive 3D view of obstacles and optimized path
+      2. 2D Projections - XY, XZ, YZ plane views with safety zones
+      3. Performance - Cost breakdown, fitness curves, diversity plots
+      4. Trajectory - Time-parametrized position, velocity, acceleration, curvature
+      5. Statistics - Summary metrics and comparison with baseline
+
+    The GUI updates in real-time during optimization via Qt signals from
+    the background GAWorker thread.
+
+    Attributes
+    ----------
+    config : PlannerConfig
+        Current algorithm configuration.
+    env : Environment
+        Current obstacle environment.
+    worker : Optional[GAWorker]
+        Background thread running the GA (None when idle).
+    gen_history : List[int]
+        Generation numbers for plotting.
+    fitness_history : List[float]
+        Best fitness values per generation.
+    collision_history : List[int]
+        Collision counts per generation.
+    breakdown_history : List[dict]
+        Cost breakdowns per generation.
+    diversity_history : List[float]
+        Population diversity per generation.
+    first_collision_free_gen : Optional[int]
+        First generation achieving zero collisions.
+
+    Key Methods
+    -----------
+    start_ga() : Start optimization in background thread.
+    stop_ga() : Request early termination of optimization.
+    randomize_obstacles() : Generate new obstacle configuration.
+    save_best_path_csv() : Export best path to CSV file.
+    save_figure_png() : Export 3D visualization to PNG file.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("UAV GA Path Planner – Thesis Edition")
+        self.config = PlannerConfig()
+        self.env = Environment(self.config)
+        self.env.randomize_obstacles(self.config.obstacle_count)
+        self.worker: Optional[GAWorker] = None
+
+
+        self.seed_spin = QSpinBox()
+        self.seed_spin.setRange(0, 9999)
+        self.seed_spin.setValue(42) # "Магічне" число для гарної генерації
+        self.seed_spin.setToolTip("Фіксований seed для генерації однакових перешкод")
+
+        # history for charts
+        self.gen_history: List[int] = []
+        self.fitness_history: List[float] = []
+        self.collision_history: List[int] = []
+        self.breakdown_history: List[dict] = []  # cost breakdown per generation
+        self.diversity_history: List[float] = []  # population diversity per generation
+        self.first_collision_free_gen: Optional[int] = (
+            None  # first generation with 0 collisions
+        )
+
+        # store best path separately for CSV export (avoid extracting from matplotlib)
+        self._current_best_path: List[Tuple[float, float, float]] = []
+        self._current_breakdown: dict = {
+            "length": 0.0,
+            "safety": 0.0,
+            "smoothness": 0.0,
+            "energy": 0.0,
+        }
+
+        self._init_ui()
+        self._draw_environment()  # initial plot
+
+    # ---------------------------- UI setup ---------------------------- #
+
+    def _init_ui(self) -> None:
+        central = QWidget()
+        main_layout = QHBoxLayout(central)
+        self.setCentralWidget(central)
+
+        # ------------- LEFT PANEL: controls ------------- #
+        ctrl = QWidget()
+        ctrl_layout = QVBoxLayout(ctrl)
+
+        # Status line to quickly see what the system is doing + help button
+        self.status_label = QLabel("Status: idle")
+        self.help_btn = QPushButton("?")
+        self.help_btn.setFixedWidth(28)
+        self.help_btn.setToolTip(
+            "Натисніть, щоб відкрити довідку з поясненням усіх параметрів програми."
+        )
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_label)
+        status_row.addStretch(1)
+        status_row.addWidget(self.help_btn)
+        status_widget = QWidget()
+        status_widget.setLayout(status_row)
+        ctrl_layout.addWidget(status_widget)
+
+        lbl_ga = QLabel("<b>Genetic Algorithm</b>")
+        ctrl_layout.addWidget(lbl_ga)
+
+        # --- GA strategy and parameters ---
+        self.strategy_combo = QComboBox()
+        self.strategy_combo.addItems(
+            [
+                "Standard (GaLM)",
+                "High mutation (GaHM)",
+                "Convergence (GaCPo)",
+            ]
+        )
+        self.strategy_combo.setCurrentText(self.config.strategy)
+        ctrl_layout.addWidget(QLabel("GA strategy"))
+        ctrl_layout.addWidget(self.strategy_combo)
+
+        self.pop_spin = QSpinBox()
+        self.pop_spin.setRange(10, 1000)
+        self.pop_spin.setValue(self.config.population_size)
+        ctrl_layout.addWidget(QLabel("Population size"))
+        ctrl_layout.addWidget(self.pop_spin)
+
+        self.gen_spin = QSpinBox()
+        self.gen_spin.setRange(10, 5000)
+        self.gen_spin.setValue(self.config.num_generations)
+        ctrl_layout.addWidget(QLabel("Generations"))
+        ctrl_layout.addWidget(self.gen_spin)
+
+        self.wp_spin = QSpinBox()
+        self.wp_spin.setRange(0, 50)
+        self.wp_spin.setValue(self.config.num_waypoints)
+        ctrl_layout.addWidget(QLabel("Waypoints"))
+        ctrl_layout.addWidget(self.wp_spin)
+
+        self.cr_spin = QDoubleSpinBox()
+        self.cr_spin.setRange(0.0, 1.0)
+        self.cr_spin.setSingleStep(0.05)
+        self.cr_spin.setValue(self.config.crossover_rate)
+        ctrl_layout.addWidget(QLabel("Crossover rate"))
+        ctrl_layout.addWidget(self.cr_spin)
+
+        self.mr_spin = QDoubleSpinBox()
+        self.mr_spin.setRange(0.0, 1.0)
+        self.mr_spin.setSingleStep(0.05)
+        self.mr_spin.setValue(self.config.mutation_rate)
+        ctrl_layout.addWidget(QLabel("Mutation rate (manual override)"))
+        ctrl_layout.addWidget(self.mr_spin)
+
+        # --- Fitness Weights ---
+        ctrl_layout.addWidget(QLabel("<b>Fitness Weights</b>"))
+
+        self.w_length_spin = QDoubleSpinBox()
+        self.w_length_spin.setRange(0.0, 10.0)
+        self.w_length_spin.setSingleStep(0.05)
+        self.w_length_spin.setDecimals(2)
+        self.w_length_spin.setValue(self.config.w_length)
+        ctrl_layout.addWidget(QLabel("W-Length"))
+        ctrl_layout.addWidget(self.w_length_spin)
+
+        self.w_safety_spin = QDoubleSpinBox()
+        self.w_safety_spin.setRange(0.0, 10.0)
+        self.w_safety_spin.setSingleStep(0.05)
+        self.w_safety_spin.setDecimals(2)
+        self.w_safety_spin.setValue(self.config.w_safety)
+        ctrl_layout.addWidget(QLabel("W-Safety"))
+        ctrl_layout.addWidget(self.w_safety_spin)
+
+        self.w_smoothness_spin = QDoubleSpinBox()
+        self.w_smoothness_spin.setRange(0.0, 10.0)
+        self.w_smoothness_spin.setSingleStep(0.05)
+        self.w_smoothness_spin.setDecimals(2)
+        self.w_smoothness_spin.setValue(self.config.w_smoothness)
+        ctrl_layout.addWidget(QLabel("W-Smoothness"))
+        ctrl_layout.addWidget(self.w_smoothness_spin)
+
+        self.w_energy_spin = QDoubleSpinBox()
+        self.w_energy_spin.setRange(0.0, 10.0)
+        self.w_energy_spin.setSingleStep(0.05)
+        self.w_energy_spin.setDecimals(2)
+        self.w_energy_spin.setValue(self.config.w_energy)
+        ctrl_layout.addWidget(QLabel("W-Energy"))
+        ctrl_layout.addWidget(self.w_energy_spin)
+
+        self.obs_spin = QSpinBox()
+        self.obs_spin.setRange(0, 100)
+        self.obs_spin.setValue(self.config.obstacle_count)
+        ctrl_layout.addWidget(QLabel("Obstacle count"))
+        ctrl_layout.addWidget(self.obs_spin)
+
+        self.dynamic_check = QCheckBox("Dynamic obstacles")
+        self.dynamic_check.setChecked(self.config.dynamic_obstacles)
+        ctrl_layout.addWidget(self.dynamic_check)
+
+        self.update_spin = QSpinBox()
+        self.update_spin.setRange(1, 1000)
+        self.update_spin.setValue(self.config.update_interval)
+        ctrl_layout.addWidget(QLabel("Update every N generations"))
+        ctrl_layout.addWidget(self.update_spin)
+
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setRange(0.1, 50.0)
+        self.speed_spin.setValue(self.config.uav_speed)
+        self.speed_spin.setSingleStep(0.5)
+        ctrl_layout.addWidget(QLabel("UAV reference speed [m/s]"))
+        ctrl_layout.addWidget(self.speed_spin)
+
+        # --- Start / Goal selection ---
+        # Environment Z bounds
+        ctrl_layout.addWidget(QLabel("<b>Environment Z bounds</b>"))
+        z_bounds_row = QHBoxLayout()
+        self.min_z_spin = QDoubleSpinBox()
+        self.min_z_spin.setRange(0.0, 500.0)
+        self.min_z_spin.setDecimals(0)
+        self.min_z_spin.setValue(self.config.min_z)
+        self.max_z_spin = QDoubleSpinBox()
+        self.max_z_spin.setRange(0.0, 500.0)
+        self.max_z_spin.setDecimals(0)
+        self.max_z_spin.setValue(self.config.max_z)
+        z_bounds_row.addWidget(QLabel("Min Z"))
+        z_bounds_row.addWidget(self.min_z_spin)
+        z_bounds_row.addWidget(QLabel("Max Z"))
+        z_bounds_row.addWidget(self.max_z_spin)
+        z_bounds_widget = QWidget()
+        z_bounds_widget.setLayout(z_bounds_row)
+        ctrl_layout.addWidget(z_bounds_widget)
+
+        ctrl_layout.addWidget(QLabel("<b>Start / Goal positions</b>"))
+
+        # Start position controls
+        self.start_x_spin = QDoubleSpinBox()
+        self.start_y_spin = QDoubleSpinBox()
+        self.start_z_spin = QDoubleSpinBox()
+        self.start_x_spin.setRange(self.config.min_x, self.config.max_x)
+        self.start_x_spin.setDecimals(1)
+        self.start_y_spin.setRange(self.config.min_y, self.config.max_y)
+        self.start_y_spin.setDecimals(1)
+        self.start_z_spin.setRange(self.config.min_z, self.config.max_z)
+        self.start_z_spin.setDecimals(1)
+        self.start_x_spin.setValue(self.config.start[0])
+        self.start_y_spin.setValue(self.config.start[1])
+        self.start_z_spin.setValue(self.config.start[2])
+
+        start_row = QHBoxLayout()
+        start_row.addWidget(QLabel("Start X"))
+        start_row.addWidget(self.start_x_spin)
+        start_row.addWidget(QLabel("Y"))
+        start_row.addWidget(self.start_y_spin)
+        start_row.addWidget(QLabel("Z"))
+        start_row.addWidget(self.start_z_spin)
+        start_widget = QWidget()
+        start_widget.setLayout(start_row)
+        ctrl_layout.addWidget(start_widget)
+
+        # Goal position controls
+        self.goal_x_spin = QDoubleSpinBox()
+        self.goal_y_spin = QDoubleSpinBox()
+        self.goal_z_spin = QDoubleSpinBox()
+        self.goal_x_spin.setRange(self.config.min_x, self.config.max_x)
+        self.goal_x_spin.setDecimals(1)
+        self.goal_y_spin.setRange(self.config.min_y, self.config.max_y)
+        self.goal_y_spin.setDecimals(1)
+        self.goal_z_spin.setRange(self.config.min_z, self.config.max_z)
+        self.goal_z_spin.setDecimals(1)
+        self.goal_x_spin.setValue(self.config.goal[0])
+        self.goal_y_spin.setValue(self.config.goal[1])
+        self.goal_z_spin.setValue(self.config.goal[2])
+
+        goal_row = QHBoxLayout()
+        goal_row.addWidget(QLabel("Goal X"))
+        goal_row.addWidget(self.goal_x_spin)
+        goal_row.addWidget(QLabel("Y"))
+        goal_row.addWidget(self.goal_y_spin)
+        goal_row.addWidget(QLabel("Z"))
+        goal_row.addWidget(self.goal_z_spin)
+        goal_widget = QWidget()
+        goal_widget.setLayout(goal_row)
+        ctrl_layout.addWidget(goal_widget)
+
+        # Buttons
+        self.start_btn = QPushButton("Start GA")
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.rand_btn = QPushButton("Randomize obstacles")
+
+        ctrl_layout.addWidget(self.start_btn)
+        ctrl_layout.addWidget(self.stop_btn)
+        ctrl_layout.addWidget(self.rand_btn)
+
+        # Export buttons
+        self.save_path_btn = QPushButton("Save best path (CSV)")
+        self.save_fig_btn = QPushButton("Save 3D figure (PNG)")
+        ctrl_layout.addWidget(self.save_path_btn)
+        ctrl_layout.addWidget(self.save_fig_btn)
+
+        # ------------- PROGRESS PANEL ------------- #
+        progress_group = QGroupBox("Progress")
+        progress_layout = QVBoxLayout(progress_group)
+
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Gen %v / %m (%p%)")
+        progress_layout.addWidget(self.progress_bar)
+
+        # Current stats label
+        self.stats_label = QLabel("Best: -- | Collisions: --")
+        progress_layout.addWidget(self.stats_label)
+
+        # Log console
+        self.log_console = QTextEdit()
+        self.log_console.setReadOnly(True)
+        self.log_console.setMaximumHeight(120)
+        self.log_console.setStyleSheet(
+            "QTextEdit { background-color: #1e1e1e; color: #d4d4d4; font-family: monospace; font-size: 10px; }"
+        )
+        self.log_console.setPlaceholderText("GA events will appear here...")
+        progress_layout.addWidget(self.log_console)
+
+        ctrl_layout.addWidget(progress_group)
+
+        ctrl_layout.addStretch(1)
+
+        # ------------- RIGHT SIDE: tabs ------------- #
+        self.tabs = QTabWidget()
+
+        # Tab 1: 3D path
+        self.fig3d = Figure(figsize=(5, 5))
+        self.ax3d = self.fig3d.add_subplot(111, projection="3d")
+        self.canvas3d = FigureCanvas(self.fig3d)
+        toolbar3d = NavigationToolbar(self.canvas3d, self)
+
+        view3d_widget = QWidget()
+        view3d_layout = QVBoxLayout(view3d_widget)
+        view3d_layout.addWidget(toolbar3d)
+        view3d_layout.addWidget(self.canvas3d)
+
+        self.tabs.addTab(view3d_widget, "3D Path")
+
+        # Tab 2: Enhanced 2D projections
+        self.fig2d = Figure(figsize=(6, 8))
+        self.ax_xy = self.fig2d.add_subplot(311)
+        self.ax_xz = self.fig2d.add_subplot(312)
+        self.ax_yz = self.fig2d.add_subplot(313)
+        self.canvas2d = FigureCanvas(self.fig2d)
+        toolbar2d = NavigationToolbar(self.canvas2d, self)
+
+        proj_widget = QWidget()
+        proj_layout = QVBoxLayout(proj_widget)
+        proj_layout.addWidget(toolbar2d)
+        proj_layout.addWidget(self.canvas2d)
+        self.tabs.addTab(proj_widget, "2D Projections")
+
+        # Tab 3: Performance Metrics (enhanced fitness/collisions)
+        self.fig_fit = Figure(figsize=(6, 8))
+        # 2x2 grid: stacked area, total fitness, convergence rate, diversity
+        self.ax_breakdown = self.fig_fit.add_subplot(221)  # Stacked area breakdown
+        self.ax_fit = self.fig_fit.add_subplot(
+            222
+        )  # Total fitness + collision-free marker
+        self.ax_convergence = self.fig_fit.add_subplot(223)  # Convergence rate
+        self.ax_diversity = self.fig_fit.add_subplot(224)  # Population diversity
+        self.canvas_fit = FigureCanvas(self.fig_fit)
+        toolbar_fit = NavigationToolbar(self.canvas_fit, self)
+
+        fitness_widget = QWidget()
+        fitness_layout = QVBoxLayout(fitness_widget)
+        fitness_layout.addWidget(toolbar_fit)
+        fitness_layout.addWidget(self.canvas_fit)
+        self.tabs.addTab(fitness_widget, "Performance")
+
+        # Tab 4: Trajectory Analysis (enhanced with velocity, acceleration, curvature)
+        self.fig_traj = Figure(figsize=(8, 10))
+        # 3x2 grid
+        self.ax_tx = self.fig_traj.add_subplot(321)  # X(t)
+        self.ax_vel = self.fig_traj.add_subplot(322)  # Velocity V(t)
+        self.ax_ty = self.fig_traj.add_subplot(323)  # Y(t)
+        self.ax_accel = self.fig_traj.add_subplot(324)  # Acceleration A(t)
+        self.ax_tz = self.fig_traj.add_subplot(325)  # Z(t)
+        self.ax_curv = self.fig_traj.add_subplot(326)  # Curvature κ(t)
+        self.canvas_traj = FigureCanvas(self.fig_traj)
+        toolbar_traj = NavigationToolbar(self.canvas_traj, self)
+
+        traj_widget = QWidget()
+        traj_layout = QVBoxLayout(traj_widget)
+        traj_layout.addWidget(toolbar_traj)
+        traj_layout.addWidget(self.canvas_traj)
+        self.tabs.addTab(traj_widget, "Trajectory")
+
+        # Tab 5: Statistics Summary
+        self.fig_stats = Figure(figsize=(6, 6))
+        # Left side: metrics table (as text), Right side: comparison bar chart
+        self.ax_stats_table = self.fig_stats.add_subplot(121)
+        self.ax_stats_bars = self.fig_stats.add_subplot(122)
+        self.canvas_stats = FigureCanvas(self.fig_stats)
+
+        stats_widget = QWidget()
+        stats_layout = QVBoxLayout(stats_widget)
+        stats_layout.addWidget(self.canvas_stats)
+        self.tabs.addTab(stats_widget, "Statistics")
+
+        # assemble main layout
+        main_layout.addWidget(ctrl)
+        main_layout.addWidget(self.tabs, 1)
+
+        # initialise handles for 3D lines (assigned in _draw_environment)
+        # At runtime these are Line3D but stubs only know about Line2D
+        self.best_line: Optional[Line2D] = None
+        self.smooth_line: Optional[Line2D] = None
+        self._sphere_artists: list = []
+
+        # ініціалізація підказок українською для елементів керування та вкладок
+        self._init_tooltips()
+
+        # signals
+        self.start_btn.clicked.connect(self.start_ga)
+        self.stop_btn.clicked.connect(self.stop_ga)
+        self.rand_btn.clicked.connect(self.randomize_obstacles)
+        self.save_path_btn.clicked.connect(self.save_best_path_csv)
+        self.save_fig_btn.clicked.connect(self.save_figure_png)
+        self.help_btn.clicked.connect(self.show_help_dialog)
+
+    def _init_tooltips(self) -> None:
+        """Встановлює підказки українською мовою для елементів керування та вкладок."""
+        # Загальний стан і довідка
+        self.status_label.setToolTip(
+            "Короткий опис того, що зараз робить алгоритм (idle / running / finished)."
+        )
+
+        # Блок Genetic Algorithm
+        self.strategy_combo.setToolTip(
+            "Варіант генетичного алгоритму:\n"
+            "• Standard (GaLM) – базовий ГА з помірною мутацією.\n"
+            "• High mutation (GaHM) – вища інтенсивність мутацій, агресивний пошук.\n"
+            "• Convergence (GaCPo) – елітна підпопуляція + перезапуск частини популяції при застої."
+        )
+        self.pop_spin.setToolTip(
+            "Population size – кількість маршрутів (особин) у популяції.\n"
+            "Більше значення дає кращий пошук, але збільшує час обчислень."
+        )
+        self.gen_spin.setToolTip(
+            "Generations – максимальна кількість поколінь еволюції.\n"
+            "Зі збільшенням зростає шанс знайти кращий маршрут, але й час роботи."
+        )
+        self.wp_spin.setToolTip(
+            "Waypoints – кількість проміжних точок маршруту між START і GOAL.\n"
+            "Більше точок → гнучкіший маршрут, але складніший пошук і можливий оверфіт."
+        )
+        self.cr_spin.setToolTip(
+            "Crossover rate – імовірність схрещування двох батьків.\n"
+            "Високе значення посилює комбінування хороших рішень, але надто велике може руйнувати вже пристосовані особини."
+        )
+        self.mr_spin.setToolTip(
+            "Mutation rate – ручний рівень мутації хромосом.\n"
+            "Підвищення значення збільшує випадкові зміни координат проміжних точок:\n"
+            "• низьке значення – більш стабільна, але менш різноманітна популяція;\n"
+            "• високе значення – краще дослідження простору, але повільніша збіжність."
+        )
+
+        # Ваги функції пристосованості
+        self.w_length_spin.setToolTip(
+            "W-Length – вага довжини маршруту в загальній вартості.\n"
+            "Чим більша вага, тим сильніше алгоритм мінімізує загальну довжину шляху."
+        )
+        self.w_safety_spin.setToolTip(
+            "W-Safety – вага безпеки (штрафи за наближення до перешкод та зіткнення).\n"
+            "Збільшення ваги змушує алгоритм сильніше обходити перешкоди, навіть якщо шлях стає довшим."
+        )
+        self.w_smoothness_spin.setToolTip(
+            "W-Smoothness – вага гладкості траєкторії.\n"
+            "Гладка траєкторія означає менші різкі маневри, що полегшує стабілізацію БПЛА."
+        )
+        self.w_energy_spin.setToolTip(
+            "W-Energy – вага енергетичних витрат.\n"
+            "Враховуються набір висоти, зниження та кути поворотів. "
+            "Корисно для сценаріїв з обмеженим зарядом акумулятора."
+        )
+
+        # Перешкоди та динаміка
+        self.obs_spin.setToolTip(
+            "Obstacle count – кількість сферичних перешкод у середовищі.\n"
+            "Використовується при генерації сцени кнопкою «Randomize obstacles»."
+        )
+        self.dynamic_check.setToolTip(
+            "Dynamic obstacles – якщо увімкнено, перешкоди рухаються раз на N поколінь.\n"
+            "Дозволяє моделювати рухомі об’єкти та більш складне середовище."
+        )
+        self.update_spin.setToolTip(
+            "Update every N generations – як часто оновлювати графіку та статистику.\n"
+            "Менше значення → більш плавна анімація, але більші витрати процесора."
+        )
+        self.speed_spin.setToolTip(
+            "UAV reference speed – цільова швидкість БПЛА для побудови X(t), Y(t), Z(t).\n"
+            "Використовується для розрахунку часу польоту та часових графіків."
+        )
+
+        # Обмеження по висоті
+        self.min_z_spin.setToolTip(
+            "Min Z – мінімальна допустима висота польоту в моделі (наприклад, рівень землі)."
+        )
+        self.max_z_spin.setToolTip(
+            "Max Z – максимальна висота польоту.\n"
+            "Впливає на генерацію перешкод та допустимі координати старту/фінішу."
+        )
+
+        # Старт / фініш
+        self.start_x_spin.setToolTip("Координата X початкової точки маршруту (START).")
+        self.start_y_spin.setToolTip("Координата Y початкової точки маршруту (START).")
+        self.start_z_spin.setToolTip(
+            "Координата Z (висота) початкової точки маршруту (START)."
+        )
+        self.goal_x_spin.setToolTip("Координата X цільової точки маршруту (GOAL).")
+        self.goal_y_spin.setToolTip("Координата Y цільової точки маршруту (GOAL).")
+        self.goal_z_spin.setToolTip(
+            "Координата Z (висота) цільової точки маршруту (GOAL)."
+        )
+
+        # Кнопки керування
+        self.start_btn.setToolTip(
+            "Запуск генетичного алгоритму з поточними налаштуваннями.\n"
+            "Маршрут буде оптимізовано у фоновому потоці."
+        )
+        self.stop_btn.setToolTip(
+            "Акуратно зупиняє роботу генетичного алгоритму.\n"
+            "Корисно, якщо результат уже задовільний або параметри обрані невдало."
+        )
+        self.rand_btn.setToolTip(
+            "Перегенерувати набір сферичних перешкод у сцені.\n"
+            "Використовуйте перед новим запуском, щоб протестувати алгоритм на іншій конфігурації."
+        )
+        self.save_path_btn.setToolTip(
+            "Зберегти найкращий знайдений маршрут у CSV файл.\n"
+            "Файл можна використовувати як референсну траєкторію в інших експериментах."
+        )
+        self.save_fig_btn.setToolTip(
+            "Зберегти поточний 3D вигляд сцени (перешкоди + маршрут) у PNG файл.\n"
+            "Зручно для вставки ілюстрацій у дипломну роботу або презентацію."
+        )
+
+        # Прогрес і лог
+        self.progress_bar.setToolTip(
+            "Відображає поточний номер покоління та відносний прогрес оптимізації."
+        )
+        self.stats_label.setToolTip(
+            "Поточне найкраще значення функції пристосованості та кількість колізій."
+        )
+        self.log_console.setToolTip(
+            "Текстовий лог подій: ключові повідомлення від алгоритму та службова інформація.\n"
+            "Можна використати для аналізу поведінки ГА під час експериментів."
+        )
+
+        # Підказки для вкладок
+        self.tabs.setTabToolTip(
+            0,
+            "3D Path – основний тривимірний вигляд: старт/фініш, перешкоди, базова пряма та оптимізований маршрут.",
+        )
+        self.tabs.setTabToolTip(
+            1,
+            "2D Projections – проекції маршруту та перешкод на площини XY, XZ, YZ з видимими зонами небезпеки.",
+        )
+        self.tabs.setTabToolTip(
+            2,
+            "Performance – графіки збіжності: розклад вартості (length/safety/smoothness/energy), "
+            "динаміка функції пристосованості, кількість колізій і різноманіття популяції.",
+        )
+        self.tabs.setTabToolTip(
+            3,
+            "Trajectory – часові графіки X(t), Y(t), Z(t), модуля швидкості, прискорення та кривизни маршруту.",
+        )
+        self.tabs.setTabToolTip(
+            4,
+            "Statistics – зведена таблиця характеристик маршруту та стовпчикове порівняння з базовою прямою.",
+        )
+
+
+    def show_help_dialog(self) -> None:
+        """Показує узагальнену довідку щодо налаштувань та візуалізацій."""
+        text = (
+            "<b>UAV Genetic Algorithm Path Planner – довідка</b><br><br>"
+            "<b>Призначення</b><br>"
+            "Застосунок будує тривимірний маршрут БПЛА в середовищі з сферичними перешкодами "
+            "за допомогою генетичного алгоритму. Кожен маршрут – це послідовність проміжних "
+            "3D точок (waypoints), а ціль – знайти безпечний, відносно короткий та енергоефективний шлях.<br><br>"
+            "<b>Головні групи налаштувань</b><br>"
+            "<b>1. Genetic Algorithm</b><br>"
+            "• GA strategy – вибір варіанту ГА (Standard / High mutation / Convergence). "
+            "Convergence (GaCPo) поєднує елітну підпопуляцію та заміну частини популяції при застої.<br>"
+            "• Population size – кількість маршрутів у популяції. Збільшення покращує пошук, але "
+            "пропорційно збільшує час обчислень.<br>"
+            "• Generations – максимально допустима кількість поколінь еволюції.<br>"
+            "• Waypoints – розмір хромосоми, тобто кількість проміжних точок між START і GOAL.<br>"
+            "• Crossover rate – імовірність схрещування батьківських маршрутів.<br>"
+            "• Mutation rate – інтенсивність випадкових змін координат проміжних точок.<br><br>"
+            "<b>2. Fitness Weights</b><br>"
+            "• W-Length – наскільки сильно алгоритм мінімізує загальну довжину шляху.<br>"
+            "• W-Safety – штрафи за проходження всередині або занадто близько до перешкод "
+            "(включно з лінійними перетинами сфер).<br>"
+            "• W-Smoothness – штраф за велику кривизну маршруту (різкі маневри).<br>"
+            "• W-Energy – штраф за набір/скидання висоти та часті повороти; "
+            "можна інтерпретувати як спрощену модель енергоспоживання.<br><br>"
+            "<b>3. Перешкоди та динаміка</b><br>"
+            "• Obstacle count – кількість сферичних перешкод у кубічному просторі.<br>"
+            "• Dynamic obstacles – якщо увімкнено, перешкоди періодично зміщуються, "
+            "імітують рухомі об’єкти; це ускладнює задачу планування.<br>"
+            "• Update every N generations – контролює, як часто оновлюються графіки; "
+            "менше значення дає більш плавну анімацію, але вище навантаження на CPU.<br><br>"
+            "<b>4. Геометрія сцени</b><br>"
+            "• Min Z / Max Z – вертикальні межі середовища, в яких існують перешкоди та маршрут.<br>"
+            "• Start / Goal – початкова та кінцева точки місії, які завжди входять до траєкторії.<br><br>"
+            "<b>5. Кнопки</b><br>"
+            "• Start GA – запускає оптимізацію у фоновому потоці, щоб інтерфейс не зависав.<br>"
+            "• Stop – коректно перериває поточний запуск ГА.<br>"
+            "• Randomize obstacles – генерує нову конфігурацію сферичних перешкод.<br>"
+            "• Save best path (CSV) – експортує знайдений маршрут у вигляді списку точок.<br>"
+            "• Save 3D figure (PNG) – зберігає поточний 3D вигляд сцени для диплома або звітів.<br><br>"
+            "<b>6. Вкладки з візуалізаціями</b><br>"
+            "• 3D Path – просторовий вигляд сцени з перешкодами, стартом/фінішем, "
+            "базовою прямою та найкращою траєкторією (включно з B-spline згладжуванням).<br>"
+            "• 2D Projections – проекції на XY, XZ, YZ з зонами небезпеки (червоні кола) та "
+            "колірним градієнтом ризику вздовж згладженого маршруту.<br>"
+            "• Performance – чотири графіки: розклад вартості (Length/Safety/Smoothness/Energy), "
+            "динаміка найкращої вартості, покоління першого безколізійного маршруту та різноманіття популяції.<br>"
+            "• Trajectory – X(t), Y(t), Z(t), модуль швидкості, прискорення та кривизна κ(t). "
+            "Ці криві корисні для аналізу навантаження на систему керування БПЛА.<br>"
+            "• Statistics – зведені числові показники (довжина шляху, час польоту, висота, "
+            "кількість колізій, відсоток покращення) та порівняння з прямою лінією.<br><br>"
+            "<b>Порада:</b> наведіть курсор миші на будь який елемент керування або вкладку, "
+            "щоб побачити коротку українську підказку з інженерним поясненням параметра."
+        )
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Довідка по налаштуваннях")
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(text)
+        msg.exec()
+
+    # ---------------------- plotting helpers (3D) --------------------- #
+
+    def _draw_environment(self):
+        """Draw world, obstacles, start/goal and empty path lines."""
+        self.ax3d.clear()
+        cfg = self.config
+
+        # equal aspect box
+        max_range = (
+            max(cfg.max_x - cfg.min_x, cfg.max_y - cfg.min_y, cfg.max_z - cfg.min_z)
+            / 2.0
+        )
+        mid_x = (cfg.max_x + cfg.min_x) / 2.0
+        mid_y = (cfg.max_y + cfg.min_y) / 2.0
+        mid_z = (cfg.max_z + cfg.min_z) / 2.0
+        self.ax3d.set_xlim(mid_x - max_range, mid_x + max_range)
+        self.ax3d.set_ylim(mid_y - max_range, mid_y + max_range)
+        self.ax3d.set_zlim(mid_z - max_range, mid_z + max_range)
+        self.ax3d.set_xlabel("X")
+        self.ax3d.set_ylabel("Y")
+        self.ax3d.set_zlabel("Z")
+
+        self._sphere_artists.clear()
+        sphere_res = self.config.sphere_render_resolution
+        for ox, oy, oz, r in self.env.obstacles:
+            u = np.linspace(0, 2 * np.pi, sphere_res)
+            v = np.linspace(0, np.pi, sphere_res)
+            xs = ox + r * np.outer(np.cos(u), np.sin(v))
+            ys = oy + r * np.outer(np.sin(u), np.sin(v))
+            zs = oz + r * np.outer(np.ones_like(u), np.cos(v))
+            # Solid surface with higher opacity for better visibility
+            surf = self.ax3d.plot_surface(
+                xs,
+                ys,
+                zs,
+                color=(1.0, 0.3, 0.2, 0.55),  # vibrant red-orange, 55% opacity
+                linewidth=0,
+                antialiased=True,
+                shade=True,
+            )
+            self._sphere_artists.append(surf)
+            # Wireframe overlay for edge definition
+            wire = self.ax3d.plot_wireframe(
+                xs,
+                ys,
+                zs,
+                color=(0.3, 0.0, 0.0),  # dark red edges
+                linewidth=0.5,
+                rstride=2,  # reduce density for cleaner look
+                cstride=2,
+            )
+            self._sphere_artists.append(wire)
+
+        # start / goal
+        sx, sy, sz = cfg.start
+        gx, gy, gz = cfg.goal
+        # Note: matplotlib 3D scatter type stubs incorrectly type 'zs' as int
+        self.ax3d.scatter(
+            [sx],
+            [sy],
+            [sz],  # pyright: ignore[reportArgumentType]
+            color="green",
+            s=50,
+            marker="o",
+            label="Start",
+        )
+        self.ax3d.scatter(
+            [gx],
+            [gy],
+            [gz],  # pyright: ignore[reportArgumentType]
+            color="red",
+            s=50,
+            marker="^",
+            label="Goal",
+        )
+
+        # baseline straight line
+        self.ax3d.plot(
+            [sx, gx], [sy, gy], [sz, gz], color="gray", linestyle="--", label="Baseline"
+        )
+
+        # path lines (initially empty)
+        # Note: ax3d.plot() returns Line3D at runtime but stubs say Line2D
+        (self.best_line,) = self.ax3d.plot(
+            [], [], [], color="blue", linewidth=2, label="Best path"
+        )
+        (self.smooth_line,) = self.ax3d.plot(
+            [], [], [], color="orange", linewidth=3, label="Smoothed"
+        )
+
+        self.ax3d.legend(loc="upper right")
+        self.canvas3d.draw()
+
+        # also refresh projections
+        self._draw_projections([], [])
+
+    def _update_path_plot(
+        self,
+        path: List[Tuple[float, float, float]],
+        smooth: Optional[List[Tuple[float, float, float]]] = None,
+    ):
+        """Update 3D path + 2D projections."""
+        if path and self.best_line is not None:
+            xs = [p[0] for p in path]
+            ys = [p[1] for p in path]
+            zs = [p[2] for p in path]
+            self.best_line.set_data(xs, ys)
+            self.best_line.set_3d_properties(zs)  # pyright: ignore[reportAttributeAccessIssue]
+        if smooth and self.smooth_line is not None:
+            xs = [p[0] for p in smooth]
+            ys = [p[1] for p in smooth]
+            zs = [p[2] for p in smooth]
+            self.smooth_line.set_data(xs, ys)
+            self.smooth_line.set_3d_properties(zs)  # pyright: ignore[reportAttributeAccessIssue]
+        self.canvas3d.draw()
+
+        self._draw_projections(path, smooth if smooth is not None else [])
+
+    # ---------------------- 2D projections & charts --------------------- #
+
+    def _draw_projections(
+        self,
+        path: List[Tuple[float, float, float]],
+        smooth: List[Tuple[float, float, float]],
+    ):
+        """Enhanced 2D projections with waypoints, safety zones, and color gradient."""
+        cfg = self.config
+        for ax in (self.ax_xy, self.ax_xz, self.ax_yz):
+            ax.clear()
+
+        # Draw obstacles with filled safety zones
+        for ox, oy, oz, r in self.env.obstacles:
+            theta = np.linspace(0, 2 * np.pi, 64)
+            # Safety zone (near_obstacle_distance)
+            safety_r = r + cfg.near_obstacle_distance
+
+            # XY projection
+            self.ax_xy.fill(
+                ox + safety_r * np.cos(theta),
+                oy + safety_r * np.sin(theta),
+                color="red",
+                alpha=0.1,
+                label="_nolegend_",
+            )
+            self.ax_xy.plot(
+                ox + r * np.cos(theta),
+                oy + r * np.sin(theta),
+                color="red",
+                linewidth=1.5,
+                alpha=0.7,
+            )
+
+            # XZ projection
+            self.ax_xz.fill(
+                ox + safety_r * np.cos(theta),
+                oz + safety_r * np.sin(theta),
+                color="red",
+                alpha=0.1,
+                label="_nolegend_",
+            )
+            self.ax_xz.plot(
+                ox + r * np.cos(theta),
+                oz + r * np.sin(theta),
+                color="red",
+                linewidth=1.5,
+                alpha=0.7,
+            )
+
+            # YZ projection
+            self.ax_yz.fill(
+                oy + safety_r * np.cos(theta),
+                oz + safety_r * np.sin(theta),
+                color="red",
+                alpha=0.1,
+                label="_nolegend_",
+            )
+            self.ax_yz.plot(
+                oy + r * np.cos(theta),
+                oz + r * np.sin(theta),
+                color="red",
+                linewidth=1.5,
+                alpha=0.7,
+            )
+
+        # Draw start and goal markers
+        sx, sy, sz = cfg.start
+        gx, gy, gz = cfg.goal
+        self.ax_xy.scatter(
+            [sx], [sy], c="green", s=100, marker="o", zorder=5, label="Start"
+        )
+        self.ax_xy.scatter(
+            [gx], [gy], c="red", s=100, marker="^", zorder=5, label="Goal"
+        )
+        self.ax_xz.scatter([sx], [sz], c="green", s=100, marker="o", zorder=5)
+        self.ax_xz.scatter([gx], [gz], c="red", s=100, marker="^", zorder=5)
+        self.ax_yz.scatter([sy], [sz], c="green", s=100, marker="o", zorder=5)
+        self.ax_yz.scatter([gy], [gz], c="red", s=100, marker="^", zorder=5)
+
+        # Draw raw path with waypoint markers
+        if path and len(path) > 2:
+            xp = [p[0] for p in path]
+            yp = [p[1] for p in path]
+            zp = [p[2] for p in path]
+
+            # Plot path line
+            self.ax_xy.plot(xp, yp, "b-", linewidth=1, alpha=0.5, label="Waypoints")
+            self.ax_xz.plot(xp, zp, "b-", linewidth=1, alpha=0.5)
+            self.ax_yz.plot(yp, zp, "b-", linewidth=1, alpha=0.5)
+
+            # Mark intermediate waypoints (excluding start/goal)
+            if len(path) > 2:
+                wx = xp[1:-1]
+                wy = yp[1:-1]
+                wz = zp[1:-1]
+                self.ax_xy.scatter(
+                    wx, wy, c="blue", s=30, marker="s", zorder=4, alpha=0.7
+                )
+                self.ax_xz.scatter(
+                    wx, wz, c="blue", s=30, marker="s", zorder=4, alpha=0.7
+                )
+                self.ax_yz.scatter(
+                    wy, wz, c="blue", s=30, marker="s", zorder=4, alpha=0.7
+                )
+
+        # Draw smoothed path with color gradient (green=safe to red=risky based on proximity)
+        if smooth and len(smooth) > 1:
+            xs = np.array([p[0] for p in smooth])
+            ys = np.array([p[1] for p in smooth])
+            zs = np.array([p[2] for p in smooth])
+
+            # Compute local cost/risk for each point (distance to nearest obstacle)
+            risks = np.zeros(len(smooth))
+            for i, (px, py, pz) in enumerate(smooth):
+                min_dist = float("inf")
+                for ox, oy, oz, r in self.env.obstacles:
+                    dist = np.sqrt((px - ox) ** 2 + (py - oy) ** 2 + (pz - oz) ** 2) - r
+                    min_dist = min(min_dist, dist)
+                # Normalize: closer to obstacle = higher risk (0-1)
+                if min_dist < 0:
+                    risks[i] = 1.0  # Inside obstacle
+                elif min_dist < cfg.near_obstacle_distance * 2:
+                    risks[i] = 1.0 - (min_dist / (cfg.near_obstacle_distance * 2))
+                else:
+                    risks[i] = 0.0
+
+            # Create color gradient from green (safe) to red (risky)
+            from matplotlib.colors import LinearSegmentedColormap
+
+            colors = [(0, 0.8, 0), (1, 1, 0), (1, 0, 0)]  # green -> yellow -> red
+            cmap = LinearSegmentedColormap.from_list("safety", colors)
+
+            # Plot colored segments
+            for i in range(len(xs) - 1):
+                color = cmap(risks[i])
+                self.ax_xy.plot(
+                    xs[i : i + 2], ys[i : i + 2], color=color, linewidth=2.5
+                )
+                self.ax_xz.plot(
+                    xs[i : i + 2], zs[i : i + 2], color=color, linewidth=2.5
+                )
+                self.ax_yz.plot(
+                    ys[i : i + 2], zs[i : i + 2], color=color, linewidth=2.5
+                )
+
+        # Labels and titles
+        self.ax_xy.set_xlabel("X [m]")
+        self.ax_xy.set_ylabel("Y [m]")
+        self.ax_xy.set_title("XY Projection (Top View)")
+        self.ax_xz.set_xlabel("X [m]")
+        self.ax_xz.set_ylabel("Z [m]")
+        self.ax_xz.set_title("XZ Projection (Side View)")
+        self.ax_yz.set_xlabel("Y [m]")
+        self.ax_yz.set_ylabel("Z [m]")
+        self.ax_yz.set_title("YZ Projection (Front View)")
+
+        for ax in (self.ax_xy, self.ax_xz, self.ax_yz):
+            ax.grid(True, alpha=0.3)
+            ax.set_aspect("equal", adjustable="box")
+
+        self.ax_xy.legend(loc="upper right", fontsize=8)
+        self.fig2d.tight_layout()
+        self.canvas2d.draw()
+
+    def _update_fitness_plots(self):
+        """Update the Performance Metrics tab with 4 subplots."""
+        self.ax_breakdown.clear()
+        self.ax_fit.clear()
+        self.ax_convergence.clear()
+        self.ax_diversity.clear()
+
+        if not self.gen_history:
+            self.fig_fit.tight_layout()
+            self.canvas_fit.draw()
+            return
+
+        gens = self.gen_history
+
+        # 1) Stacked area chart for cost breakdown
+        if self.breakdown_history:
+            lengths = [b.get("length", 0) for b in self.breakdown_history]
+            safeties = [b.get("safety", 0) for b in self.breakdown_history]
+            smooths = [b.get("smoothness", 0) for b in self.breakdown_history]
+            energies = [b.get("energy", 0) for b in self.breakdown_history]
+
+            self.ax_breakdown.stackplot(
+                gens,
+                lengths,
+                safeties,
+                smooths,
+                energies,
+                labels=["Length", "Safety", "Smoothness", "Energy"],
+                colors=["#2196F3", "#F44336", "#4CAF50", "#FF9800"],
+                alpha=0.7,
+            )
+            self.ax_breakdown.set_title("Cost Breakdown")
+            self.ax_breakdown.set_xlabel("Generation")
+            self.ax_breakdown.set_ylabel("Cost Components")
+            self.ax_breakdown.legend(loc="upper right", fontsize=8)
+            self.ax_breakdown.grid(True, alpha=0.3)
+
+        # 2) Total fitness with collision-free marker
+        self.ax_fit.plot(
+            gens, self.fitness_history, "b-", linewidth=1.5, label="Best Fitness"
+        )
+        if self.first_collision_free_gen is not None:
+            self.ax_fit.axvline(
+                x=self.first_collision_free_gen,
+                color="green",
+                linestyle="--",
+                linewidth=2,
+                label=f"Collision-free @ {self.first_collision_free_gen}",
+            )
+        # Show collisions on secondary axis
+        ax_coll = self.ax_fit.twinx()
+        ax_coll.plot(
+            gens,
+            self.collision_history,
+            "r-",
+            alpha=0.5,
+            linewidth=1,
+            label="Collisions",
+        )
+        ax_coll.set_ylabel("Collisions", color="red")
+        ax_coll.tick_params(axis="y", labelcolor="red")
+
+        self.ax_fit.set_title("Fitness & Collisions")
+        self.ax_fit.set_xlabel("Generation")
+        self.ax_fit.set_ylabel("Fitness", color="blue")
+        self.ax_fit.tick_params(axis="y", labelcolor="blue")
+        self.ax_fit.legend(loc="upper right", fontsize=8)
+        self.ax_fit.grid(True, alpha=0.3)
+
+        # 3) Convergence rate (rolling improvement)
+        if len(self.fitness_history) > 1:
+            improvements = [0.0]
+            for i in range(1, len(self.fitness_history)):
+                imp = self.fitness_history[i - 1] - self.fitness_history[i]
+                improvements.append(max(0, imp))  # Only show improvements
+
+            self.ax_convergence.bar(gens, improvements, color="#9C27B0", alpha=0.7)
+            self.ax_convergence.set_title("Convergence Rate")
+            self.ax_convergence.set_xlabel("Generation")
+            self.ax_convergence.set_ylabel("Improvement")
+            self.ax_convergence.grid(True, alpha=0.3)
+
+        # 4) Population diversity
+        if self.diversity_history:
+            self.ax_diversity.plot(gens, self.diversity_history, "g-", linewidth=1.5)
+            self.ax_diversity.fill_between(
+                gens, self.diversity_history, alpha=0.3, color="green"
+            )
+            self.ax_diversity.set_title("Population Diversity")
+            self.ax_diversity.set_xlabel("Generation")
+            self.ax_diversity.set_ylabel("Std Dev of Fitness")
+            self.ax_diversity.grid(True, alpha=0.3)
+
+        self.fig_fit.tight_layout()
+        self.canvas_fit.draw()
+
+    def _plot_time_trajectories(
+        self,
+        t: np.ndarray,
+        x: np.ndarray,
+        y: np.ndarray,
+        z: np.ndarray,
+    ) -> None:
+        """Plot time-parametrized trajectory with derived kinematics.
+
+        Generates a 3x2 grid of plots showing:
+        - Position components: X(t), Y(t), Z(t)
+        - Velocity magnitude: |v(t)| with target speed reference
+        - Acceleration magnitude: |a(t)|
+        - Path curvature: κ(t) = |v × a| / |v|³
+
+        Parameters
+        ----------
+        t : np.ndarray
+            Time values in seconds.
+        x, y, z : np.ndarray
+            Position components corresponding to each time value.
+        """
+        self.ax_tx.clear()
+        self.ax_ty.clear()
+        self.ax_tz.clear()
+        self.ax_vel.clear()
+        self.ax_accel.clear()
+        self.ax_curv.clear()
+
+        if len(t) < 2:
+            self.fig_traj.tight_layout()
+            self.canvas_traj.draw()
+            return
+
+        dt = t[1] - t[0] if len(t) > 1 else 1.0
+        positions = np.column_stack([x, y, z])
+
+        # Compute velocity (first derivative)
+        velocity = np.gradient(positions, dt, axis=0)
+        speed = np.linalg.norm(velocity, axis=1)
+
+        # Compute acceleration (second derivative)
+        acceleration = np.gradient(velocity, dt, axis=0)
+        accel_mag = np.linalg.norm(acceleration, axis=1)
+
+        # Compute curvature: κ = |v × a| / |v|³
+        cross = np.cross(velocity, acceleration)
+        cross_mag = np.linalg.norm(cross, axis=1)
+        speed_cubed = np.maximum(speed**3, 1e-9)  # Avoid division by zero
+        curvature = cross_mag / speed_cubed
+
+        # Plot X(t)
+        self.ax_tx.plot(t, x, "b-", linewidth=1.5)
+        self.ax_tx.set_ylabel("X [m]")
+        self.ax_tx.set_title("Position X(t)")
+        self.ax_tx.grid(True, alpha=0.3)
+
+        # Plot Y(t)
+        self.ax_ty.plot(t, y, "g-", linewidth=1.5)
+        self.ax_ty.set_ylabel("Y [m]")
+        self.ax_ty.set_title("Position Y(t)")
+        self.ax_ty.grid(True, alpha=0.3)
+
+        # Plot Z(t)
+        self.ax_tz.plot(t, z, "r-", linewidth=1.5)
+        self.ax_tz.set_xlabel("Time [s]")
+        self.ax_tz.set_ylabel("Z [m]")
+        self.ax_tz.set_title("Position Z(t)")
+        self.ax_tz.grid(True, alpha=0.3)
+
+        # Plot Velocity V(t)
+        self.ax_vel.plot(t, speed, "purple", linewidth=1.5)
+        self.ax_vel.fill_between(t, speed, alpha=0.3, color="purple")
+        self.ax_vel.set_ylabel("Speed [m/s]")
+        self.ax_vel.set_title("Velocity Magnitude")
+        self.ax_vel.axhline(
+            y=self.config.uav_speed,
+            color="gray",
+            linestyle="--",
+            label=f"Target: {self.config.uav_speed} m/s",
+        )
+        self.ax_vel.legend(fontsize=8)
+        self.ax_vel.grid(True, alpha=0.3)
+
+        # Plot Acceleration A(t)
+        self.ax_accel.plot(t, accel_mag, "orange", linewidth=1.5)
+        self.ax_accel.fill_between(t, accel_mag, alpha=0.3, color="orange")
+        self.ax_accel.set_ylabel("Accel [m/s²]")
+        self.ax_accel.set_title("Acceleration Magnitude")
+        self.ax_accel.grid(True, alpha=0.3)
+
+        # Plot Curvature κ(t)
+        self.ax_curv.plot(t, curvature, "teal", linewidth=1.5)
+        self.ax_curv.fill_between(t, curvature, alpha=0.3, color="teal")
+        self.ax_curv.set_xlabel("Time [s]")
+        self.ax_curv.set_ylabel("Curvature [1/m]")
+        self.ax_curv.set_title("Path Curvature")
+        self.ax_curv.grid(True, alpha=0.3)
+
+        self.fig_traj.tight_layout()
+        self.canvas_traj.draw()
+
+    def _update_statistics_tab(
+        self, raw_path: list, smooth_path: list, best_cost: float, breakdown: dict
+    ) -> None:
+        """Update the Statistics Summary tab with metrics and comparison chart.
+
+        Displays two side-by-side visualizations:
+        - Left: Text table with path metrics (length, time, altitudes, costs)
+        - Right: Bar chart comparing optimized path vs baseline (straight line)
+
+        Parameters
+        ----------
+        raw_path : list
+            Original waypoint path from the GA.
+        smooth_path : list
+            B-spline smoothed path.
+        best_cost : float
+            Total fitness cost of the best solution.
+        breakdown : dict
+            Cost breakdown with keys: length, safety, smoothness, energy.
+        """
+        self.ax_stats_table.clear()
+        self.ax_stats_bars.clear()
+
+        # Calculate metrics
+        raw_pts = np.array(raw_path, dtype=float) if raw_path else np.zeros((1, 3))
+        smooth_pts = (
+            np.array(smooth_path, dtype=float) if smooth_path else np.zeros((1, 3))
+        )
+
+        # Path length
+        if len(smooth_pts) > 1:
+            seg = smooth_pts[1:] - smooth_pts[:-1]
+            path_length = float(np.sum(np.linalg.norm(seg, axis=1)))
+        else:
+            path_length = 0.0
+
+        # Baseline (straight line) length
+        start = np.array(self.config.start)
+        goal = np.array(self.config.goal)
+        baseline_length = float(np.linalg.norm(goal - start))
+
+        # Flight time
+        flight_time = (
+            path_length / self.config.uav_speed if self.config.uav_speed > 0 else 0.0
+        )
+        baseline_time = (
+            baseline_length / self.config.uav_speed
+            if self.config.uav_speed > 0
+            else 0.0
+        )
+
+        # Altitude stats
+        if len(smooth_pts) > 0:
+            max_alt = float(np.max(smooth_pts[:, 2]))
+            min_alt = float(np.min(smooth_pts[:, 2]))
+            total_climb = float(np.sum(np.maximum(np.diff(smooth_pts[:, 2]), 0)))
+        else:
+            max_alt = min_alt = total_climb = 0.0
+
+        # Collisions
+        collisions = self.collision_history[-1] if self.collision_history else 0
+
+        # Improvement from initial
+        if self.fitness_history:
+            initial_cost = self.fitness_history[0]
+            improvement = (
+                (initial_cost - best_cost) / initial_cost * 100
+                if initial_cost > 0
+                else 0
+            )
+        else:
+            improvement = 0.0
+
+        # --- Left subplot: Metrics Table ---
+        self.ax_stats_table.axis("off")
+        table_data = [
+            ["Metric", "Value", "vs Baseline"],
+            [
+                "Path Length",
+                f"{path_length:.1f} m",
+                f"+{(path_length / baseline_length - 1) * 100:.1f}%"
+                if baseline_length > 0
+                else "-",
+            ],
+            [
+                "Flight Time",
+                f"{flight_time:.1f} s",
+                f"+{(flight_time / baseline_time - 1) * 100:.1f}%"
+                if baseline_time > 0
+                else "-",
+            ],
+            ["Max Altitude", f"{max_alt:.1f} m", "-"],
+            ["Min Altitude", f"{min_alt:.1f} m", "-"],
+            ["Total Climb", f"{total_climb:.1f} m", "-"],
+            ["Avg Speed", f"{self.config.uav_speed:.1f} m/s", "-"],
+            ["Collisions", f"{collisions}", "✓" if collisions == 0 else "✗"],
+            ["Final Cost", f"{best_cost:.2f}", f"-{improvement:.1f}% from initial"],
+        ]
+
+        # Add breakdown
+        if breakdown:
+            table_data.append(["--- Cost Breakdown ---", "", ""])
+            table_data.append(["  Length", f"{breakdown.get('length', 0):.1f}", ""])
+            table_data.append(["  Safety", f"{breakdown.get('safety', 0):.1f}", ""])
+            table_data.append(
+                ["  Smoothness", f"{breakdown.get('smoothness', 0):.2f}", ""]
+            )
+            table_data.append(["  Energy", f"{breakdown.get('energy', 0):.2f}", ""])
+
+        # Convergence info
+        if self.first_collision_free_gen is not None:
+            table_data.append(
+                ["Collision-free at", f"Gen {self.first_collision_free_gen}", ""]
+            )
+
+        # Draw table as text
+        y_pos = 0.95
+        for row in table_data:
+            text = f"{row[0]:<20} {row[1]:<15} {row[2]}"
+            self.ax_stats_table.text(
+                0.05,
+                y_pos,
+                text,
+                transform=self.ax_stats_table.transAxes,
+                fontsize=9,
+                fontfamily="monospace",
+                verticalalignment="top",
+            )
+            y_pos -= 0.055
+
+        self.ax_stats_table.set_title(
+            "Summary Statistics", fontsize=11, fontweight="bold"
+        )
+
+        # --- Right subplot: Comparison Bar Chart ---
+        metrics = ["Path\nLength", "Flight\nTime", "Cost\nBreakdown"]
+        your_values = [path_length, flight_time, best_cost]
+        baseline_values = [
+            baseline_length,
+            baseline_time,
+            best_cost * 1.5,
+        ]  # Estimate baseline cost
+
+        x = np.arange(len(metrics))
+        width = 0.35
+
+        bars1 = self.ax_stats_bars.bar(
+            x - width / 2, your_values, width, label="Optimized Path", color="#4CAF50"
+        )
+        bars2 = self.ax_stats_bars.bar(
+            x + width / 2,
+            baseline_values,
+            width,
+            label="Baseline",
+            color="#9E9E9E",
+            alpha=0.7,
+        )
+
+        self.ax_stats_bars.set_ylabel("Value")
+        self.ax_stats_bars.set_title("Path Comparison", fontsize=11, fontweight="bold")
+        self.ax_stats_bars.set_xticks(x)
+        self.ax_stats_bars.set_xticklabels(metrics, fontsize=9)
+        self.ax_stats_bars.legend(fontsize=8)
+        self.ax_stats_bars.grid(True, alpha=0.3, axis="y")
+
+        # Add value labels on bars
+        for bar in bars1:
+            height = bar.get_height()
+            self.ax_stats_bars.annotate(
+                f"{height:.1f}",
+                xy=(bar.get_x() + bar.get_width() / 2, height),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+        self.fig_stats.tight_layout()
+        self.canvas_stats.draw()
+
+    # -------------------------- GA control logic ------------------------- #
+
+    def _log_event(self, message: str) -> None:
+        """Append a timestamped message to the log console."""
+        import datetime
+
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.log_console.append(f"[{timestamp}] {message}")
+        # Auto-scroll to bottom
+        scrollbar = self.log_console.verticalScrollBar()
+        if scrollbar is not None:
+            scrollbar.setValue(scrollbar.maximum())
+
+    def _sync_config_from_ui(self) -> None:
+        """Copy all user-selected parameters from the GUI into the config object."""
+        self.config.strategy = self.strategy_combo.currentText()
+        self.config.population_size = self.pop_spin.value()
+        self.config.num_generations = self.gen_spin.value()
+        self.config.num_waypoints = self.wp_spin.value()
+        self.config.crossover_rate = self.cr_spin.value()
+        # allow user to override strategy mutation if they want
+        self.config.mutation_rate = self.mr_spin.value()
+
+        # Fitness weights
+        self.config.w_length = float(self.w_length_spin.value())
+        self.config.w_safety = float(self.w_safety_spin.value())
+        self.config.w_smoothness = float(self.w_smoothness_spin.value())
+        self.config.w_energy = float(self.w_energy_spin.value())
+
+        self.config.obstacle_count = self.obs_spin.value()
+        self.config.dynamic_obstacles = self.dynamic_check.isChecked()
+        self.config.update_interval = self.update_spin.value()
+        self.config.uav_speed = float(self.speed_spin.value())
+
+        # Z bounds from GUI
+        self.config.min_z = float(self.min_z_spin.value())
+        self.config.max_z = float(self.max_z_spin.value())
+
+        # Start / goal from GUI (mission-level control)
+        self.config.start = (
+            float(self.start_x_spin.value()),
+            float(self.start_y_spin.value()),
+            float(self.start_z_spin.value()),
+        )
+        self.config.goal = (
+            float(self.goal_x_spin.value()),
+            float(self.goal_y_spin.value()),
+            float(self.goal_z_spin.value()),
+        )
+
+    def start_ga(self) -> None:
+        """Create a worker and start the GA optimisation run."""
+        if self.worker is not None and self.worker.isRunning():
+            return
+
+        old_obstacle_count = self.config.obstacle_count
+        self._sync_config_from_ui()
+
+        # Only regenerate obstacles if count changed; otherwise keep existing obstacles
+        # This allows running multiple experiments on the same obstacle configuration
+        if self.config.obstacle_count != old_obstacle_count or not self.env.obstacles:
+            self.env = Environment(self.config)
+            self.env.randomize_obstacles(self.config.obstacle_count)
+        else:
+            # Update config reference in environment for any changed bounds
+            self.env.config = self.config
+        self._draw_environment()
+
+        # reset histories
+        self.gen_history.clear()
+        self.fitness_history.clear()
+        self.collision_history.clear()
+        self.breakdown_history.clear()
+        self.diversity_history.clear()
+        self.first_collision_free_gen = None
+        self._update_fitness_plots()
+
+        # Reset and configure progress panel
+        self.progress_bar.setRange(0, self.config.num_generations)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat(f"Gen %v / {self.config.num_generations} (%p%)")
+        self.stats_label.setText("Best: -- | Collisions: --")
+        self.log_console.clear()
+        self._log_event(
+            f"Starting GA: pop={self.config.population_size}, "
+            f"gens={self.config.num_generations}, strategy={self.config.strategy}"
+        )
+
+        self.worker = GAWorker(self.config, self.env)
+        self.worker.progress.connect(self.on_ga_progress)
+        self.worker.finished.connect(self.on_ga_finished)
+        self.worker.start()
+
+        if self.status_label is not None:
+            self.status_label.setText("Status: running GA optimisation...")
+
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.rand_btn.setEnabled(False)
+
+    def stop_ga(self) -> None:
+        if self.worker is not None:
+            self.worker.stop()
+            self._log_event("Stop requested - finishing current generation...")
+        self.stop_btn.setEnabled(False)
+        if self.status_label is not None:
+            self.status_label.setText(
+                "Status: stopping (will finish current generation)..."
+            )
+
+    def on_ga_progress(
+        self,
+        gen: int,
+        best_cost: float,
+        collisions: int,
+        best_path: list,
+        breakdown: dict,
+        diversity: float,
+    ) -> None:
+        """Slot called from the worker thread every N generations."""
+        self.setWindowTitle(
+            f"UAV GA Path Planner – Gen {gen}/{self.config.num_generations} "
+            f"| cost={best_cost:.1f} | coll={collisions}"
+        )
+        self.gen_history.append(gen)
+        self.fitness_history.append(best_cost)
+        self.collision_history.append(collisions)
+        self.breakdown_history.append(breakdown.copy())
+        self.diversity_history.append(diversity)
+        self._current_best_path = best_path  # store for CSV export
+        self._current_breakdown = breakdown.copy()
+
+        # Track first collision-free generation
+        if collisions == 0 and self.first_collision_free_gen is None:
+            self.first_collision_free_gen = gen
+            self._log_event(f"Gen {gen}: First collision-free solution found!")
+
+        self._update_fitness_plots()
+        self._update_path_plot(best_path)
+
+        # Update progress panel
+        self.progress_bar.setValue(gen)
+        self.stats_label.setText(f"Best: {best_cost:.2f} | Collisions: {collisions}")
+
+        # Log significant events (not every update to avoid spam)
+        if gen == self.config.update_interval:  # first update
+            self._log_event(f"Gen {gen}: cost={best_cost:.1f}, coll={collisions}")
+        elif len(self.fitness_history) >= 2:
+            prev_cost = self.fitness_history[-2]
+            if best_cost < prev_cost:
+                improvement = prev_cost - best_cost
+                self._log_event(
+                    f"Gen {gen}: improved by {improvement:.1f} -> cost={best_cost:.1f}"
+                )
+
+        if self.status_label is not None:
+            self.status_label.setText(
+                f"Status: running (gen {gen}/{self.config.num_generations}, "
+                f"best={best_cost:.1f}, coll={collisions})"
+            )
+
+    def on_ga_finished(
+        self, best_path: list, best_cost: float, breakdown: dict
+    ) -> None:
+        """Slot called when the worker has finished the optimisation run."""
+        self._current_breakdown = breakdown.copy()
+        smooth = GeneticPlanner.smooth_path(best_path)
+        self._update_path_plot(best_path, smooth)
+
+        # generate time-parametrised trajectory and plot (static method, no planner needed)
+        t, xs, ys, zs = GeneticPlanner.generate_time_parametrised_trajectory(
+            smooth, self.config.uav_speed
+        )
+        self._plot_time_trajectories(t, xs, ys, zs)
+
+        # Update statistics tab
+        self._update_statistics_tab(best_path, smooth, best_cost, breakdown)
+
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.rand_btn.setEnabled(True)
+
+        # Finalize progress panel
+        collisions = self.collision_history[-1] if self.collision_history else 0
+        self.progress_bar.setValue(self.config.num_generations)
+        self.stats_label.setText(f"Best: {best_cost:.2f} | Collisions: {collisions}")
+        self._log_event(
+            f"GA finished! Final cost={best_cost:.2f}, collisions={collisions}"
+        )
+        self._log_event(f"Path smoothed with {len(smooth)} points")
+
+        if self.status_label is not None:
+            self.status_label.setText(
+                f"Status: finished (best_cost={best_cost:.2f}, collisions={collisions})"
+            )
+
+        # release worker reference
+        self.worker = None
+
+        QMessageBox.information(
+            self,
+            "GA finished",
+            f"Best cost: {best_cost:.2f}\nCollisions in best path: {collisions}",
+        )
+
+    def randomize_obstacles(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self.env.randomize_obstacles(self.config.obstacle_count)
+        self._draw_environment()
+        self._log_event(f"Randomized {self.config.obstacle_count} obstacles")
+        if self.status_label is not None:
+            self.status_label.setText("Status: obstacles randomised.")
+
+    # -------------------------- export helpers --------------------------- #
+
+    def save_best_path_csv(self) -> None:
+        if not self._current_best_path:
+            QMessageBox.warning(self, "No data", "Run the GA first.")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save best path CSV", "best_path.csv", "CSV files (*.csv)"
+        )
+        if not filename:
+            return
+
+        # Use stored path data instead of extracting from matplotlib artist
+        data = np.array(self._current_best_path, dtype=float)
+        header = "x,y,z"
+        try:
+            np.savetxt(filename, data, delimiter=",", header=header, comments="")
+            QMessageBox.information(self, "Saved", f"Best path saved to:\n{filename}")
+        except Exception as e:  # pragma: no cover - defensive
+            QMessageBox.critical(self, "Error", f"Failed to save CSV:\n{e}")
+
+    def save_figure_png(self) -> None:
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save 3D figure", "uav_path.png", "PNG files (*.png)"
+        )
+        if not filename:
+            return
+        try:
+            self.fig3d.savefig(filename, dpi=300)
+            QMessageBox.information(self, "Saved", f"3D figure saved to:\n{filename}")
+        except Exception as e:  # pragma: no cover - defensive
+            QMessageBox.critical(self, "Error", f"Failed to save PNG:\n{e}")
+
+    # ------------------------------ Qt hooks ----------------------------- #
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(1000)
+        event.accept()
+# ======================================================================
+# ENTRY POINT
+# ======================================================================
+def main() -> None:
+    """Application entry point.
+
+    Creates the QApplication, instantiates the main window, and starts
+    the Qt event loop. This function can be called directly or via the
+    `uav-planner` console script defined in pyproject.toml.
+    """
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.resize(1400, 900)
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
