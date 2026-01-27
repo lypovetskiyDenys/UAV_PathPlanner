@@ -24,6 +24,11 @@ The project focuses on developing and simulating a control system that utilizes 
 
 *Figure 1: Visualization of the UAV flight path generation.*
 
+<img width="1048" height="919" alt="image" src="https://github.com/user-attachments/assets/ae89ea46-81bf-40f7-b2bf-a0593b4a1549" />
+
+*Figure 2: 3D path representation*
+
+
 ### Genetic Algorithm Performance
 ![GA Graphs](path/to/your/screenshot2.png)
 *Figure 2: Convergence graph showing fitness score improvement over generations.*
