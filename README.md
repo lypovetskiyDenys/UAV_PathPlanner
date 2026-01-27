@@ -30,11 +30,16 @@ The project focuses on developing and simulating a control system that utilizes 
 
 <img width="456" height="1297" alt="image" src="https://github.com/user-attachments/assets/c08312d5-902d-43a4-a334-8f31460b6c69" />
 
-*Figure 2: 2D projections*
+*Figure 3: 2D projections*
+
+<img width="2084" height="1298" alt="image" src="https://github.com/user-attachments/assets/6c860461-4bd4-4eda-ac1b-b9d60445454c" />
+
+*Figure 4: Performance*
+
 
 ### Genetic Algorithm Performance
 ![GA Graphs](path/to/your/screenshot2.png)
-*Figure 2: Convergence graph showing fitness score improvement over generations.*
+*Figure 4: Convergence graph showing fitness score improvement over generations.*
 
 ## 🛠️ Technology Stack
 
