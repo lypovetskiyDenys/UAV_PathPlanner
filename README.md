@@ -40,6 +40,10 @@ The project focuses on developing and simulating a control system that utilizes 
 
 *Figure 5: Trajectory*
 
+<img width="2077" height="1352" alt="image" src="https://github.com/user-attachments/assets/312a4d9a-782e-4076-89f6-3ebd561f0de2" />
+
+*Figure 6: Statistics*
+
 ### Genetic Algorithm Performance
 ![GA Graphs](path/to/your/screenshot2.png)
 *Figure 4: Convergence graph showing fitness score improvement over generations.*
