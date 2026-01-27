@@ -48,7 +48,9 @@ The project focuses on developing and simulating a control system that utilizes 
 
 *Figure 7: Control Menu*
 
+<img width="415" height="1389" alt="image" src="https://github.com/user-attachments/assets/62157869-c902-4faa-94e2-124d6c5cc39d" />
 
+*Figure 8: Hint*
 
 
 
