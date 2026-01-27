@@ -28,6 +28,9 @@ The project focuses on developing and simulating a control system that utilizes 
 
 *Figure 2: 3D path representation*
 
+<img width="456" height="1297" alt="image" src="https://github.com/user-attachments/assets/c08312d5-902d-43a4-a334-8f31460b6c69" />
+
+*Figure 2: 2D projections*
 
 ### Genetic Algorithm Performance
 ![GA Graphs](path/to/your/screenshot2.png)
