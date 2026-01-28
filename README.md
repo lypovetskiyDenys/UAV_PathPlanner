@@ -6,7 +6,11 @@
 
 ## About
 
-This repository contains the source code and documentation for my Master's thesis: **"Method of UAV Control Based on Genetic Algorithms"**.
+This repository contains the source code and documentation 
+
+For my Master's thesis: 
+
+**"Method of UAV Control Based on Genetic Algorithms"**.
 
 The project focuses on developing and simulating a control system that utilizes genetic algorithms (GA) to optimize flight paths and stabilize UAV behavior under various conditions. By mimicking natural selection processes, the system evolves optimal control parameters to adapt to changing environments and mission requirements.
 
