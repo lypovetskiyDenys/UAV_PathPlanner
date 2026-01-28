@@ -24,9 +24,10 @@ The project focuses on developing and simulating a control system that utilizes 
 ## Screenshots
 
 
+
 <img width="2560" height="1440" alt="image" src="https://github.com/user-attachments/assets/a7dd1183-2bd5-4900-981e-8bd401231d7e" />
 
-### Simulation Interface
+*Figure 1: Simulation Interface*
 
 <img width="1048" height="919" alt="image" src="https://github.com/user-attachments/assets/ae89ea46-81bf-40f7-b2bf-a0593b4a1549" />
 
