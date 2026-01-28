@@ -31,7 +31,7 @@ The project focuses on developing and simulating a control system that utilizes 
 
 <img width="1048" height="919" alt="image" src="https://github.com/user-attachments/assets/ae89ea46-81bf-40f7-b2bf-a0593b4a1549" />
 
-*Figure 2: Visualization of the UAV flight path generation.
+*Figure 2: Visualization of the UAV flight path generation.*
 
 <img width="419" height="1430" alt="image" src="https://github.com/user-attachments/assets/daeccadf-49e4-4312-9632-cb946527577d" />
 
