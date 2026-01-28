@@ -28,31 +28,33 @@ The project focuses on developing and simulating a control system that utilizes 
 
 *Figure 2: 3D path representation*
 
+<img width="419" height="1430" alt="image" src="https://github.com/user-attachments/assets/daeccadf-49e4-4312-9632-cb946527577d" />
+
+*Figure 3: Control Menu*
+
 <img width="456" height="1297" alt="image" src="https://github.com/user-attachments/assets/c08312d5-902d-43a4-a334-8f31460b6c69" />
 
-*Figure 3: 2D projections*
+*Figure 4: 2D projections*
 
 <img width="2084" height="1298" alt="image" src="https://github.com/user-attachments/assets/6c860461-4bd4-4eda-ac1b-b9d60445454c" />
 
-*Figure 4: Performance*
+*Figure 5: Performance*
 
 <img width="2084" height="1309" alt="image" src="https://github.com/user-attachments/assets/13315b73-b0c4-4bc4-a909-b792bb9aed23" />
 
-*Figure 5: Trajectory*
+*Figure 6: Trajectory*
 
 <img width="2077" height="1352" alt="image" src="https://github.com/user-attachments/assets/312a4d9a-782e-4076-89f6-3ebd561f0de2" />
 
-*Figure 6: Statistics*
-
-<img width="419" height="1430" alt="image" src="https://github.com/user-attachments/assets/daeccadf-49e4-4312-9632-cb946527577d" />
-
-*Figure 7: Control Menu*
+*Figure 7: Statistics*
 
 <img width="415" height="1389" alt="image" src="https://github.com/user-attachments/assets/62157869-c902-4faa-94e2-124d6c5cc39d" />
 
 *Figure 8: Hint*
 
 ## Otput:
+
+
 [01:01:19] Starting GA: pop=100, gens=200, strategy=Convergence (GaCPo)
 
 [01:01:33] Gen 5: cost=63532.1, coll=2
