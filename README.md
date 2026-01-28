@@ -87,39 +87,9 @@ The project focuses on developing and simulating a control system that utilizes 
 [01:03:00] Gen 175: improved by 69.9 -> cost=3295.1
 [01:03:09] Gen 190: improved by 6.8 -> cost=3288.4
 
-[01:03:16] GA finished! Final cost=3288.37, collisions=0
+*[01:03:16] GA finished! Final cost=3288.37, collisions=0
 
-[01:03:16] Path smoothed with 200 points
+[01:03:16] Path smoothed with 200 points*
 
 
-## 🛠️ Technology Stack
 
-* **Language:** Python
-* **Libraries:** `NumPy`, `Matplotlib`, `PyGame` (or `SimPy` / `Pandas` - *update based on your exact imports*)
-* **Tools:** Jupyter Notebooks (for analysis)
-
-## 🔧 Installation
-
-1.  **Clone the repository:**
-    ```bash
-    git clone [https://github.com/your-username/uav-genetic-control.git](https://github.com/your-username/uav-genetic-control.git)
-    cd uav-genetic-control
-    ```
-
-2.  **Create a virtual environment (optional but recommended):**
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-    ```
-
-3.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-## 💻 Usage
-
-To launch the main simulation:
-
-```bash
-python main.py
