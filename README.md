@@ -4,20 +4,20 @@
 ![Python](https://img.shields.io/badge/python-3.x-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-## 📄 About
+## About
 
 This repository contains the source code and documentation for my Master's thesis: **"Method of UAV Control Based on Genetic Algorithms"**.
 
 The project focuses on developing and simulating a control system that utilizes genetic algorithms (GA) to optimize flight paths and stabilize UAV behavior under various conditions. By mimicking natural selection processes, the system evolves optimal control parameters to adapt to changing environments and mission requirements.
 
-## 🚀 Features
+## Features
 
 * **Genetic Algorithm Implementation:** Custom evolutionary strategy for parameter optimization.
 * **Flight Simulation:** Python-based environment to test and visualize UAV behavior.
 * **Path Planning:** Autonomous route generation avoiding obstacles.
 * **Data Analysis:** Tools for evaluating the fitness and convergence of the algorithm.
 
-## 📸 Screenshots
+## Screenshots
 
 ### Simulation Interface
 <img width="2560" height="1440" alt="image" src="https://github.com/user-attachments/assets/a7dd1183-2bd5-4900-981e-8bd401231d7e" />
@@ -52,7 +52,7 @@ The project focuses on developing and simulating a control system that utilizes 
 
 *Figure 8: Hint*
 
-Otput:
+## Otput:
 [01:01:19] Starting GA: pop=100, gens=200, strategy=Convergence (GaCPo)
 
 [01:01:33] Gen 5: cost=63532.1, coll=2
@@ -84,9 +84,6 @@ Otput:
 
 [01:03:16] Path smoothed with 200 points
 
-### Genetic Algorithm Performance
-![GA Graphs](path/to/your/screenshot2.png)
-*Figure 4: Convergence graph showing fitness score improvement over generations.*
 
 ## 🛠️ Technology Stack
 
