@@ -29,9 +29,11 @@ The project is a comprehensive **3D path planning application** featuring a real
     <a href="https://numpy.org/"><img src="https://img.shields.io/badge/NumPy-013243?style=for-the-badge&logo=numpy&logoColor=white" alt="NumPy" /></a>
     <a href="https://scipy.org/"><img src="https://img.shields.io/badge/SciPy-8CAAE6?style=for-the-badge&logo=scipy&logoColor=white" alt="SciPy" /></a>
     <a href="https://matplotlib.org/"><img src="https://img.shields.io/badge/Matplotlib-11557C?style=for-the-badge&logo=python&logoColor=white" alt="Matplotlib" /></a>
-     <img src="https://github.com/user-attachments/assets/ae89ea46-81bf-40f7-b2bf-a0593b4a1549" width="100%" style="border-radius: 10px; box-shadow: 0 4px 8px 0 
 </div>
 
+<div>
+<img src="https://github.com/user-attachments/assets/ae89ea46-81bf-40f7-b2bf-a0593b4a1549" width="100%" style="border-radius: 10px; box-shadow: 0 4px 8px 0 
+</div>
 ## Features
 
 * **Multi-Strategy Optimization:** Choose between `GaLM` (Standard), `GaHM` (High Mutation), and `GaCPo` (Convergence) strategies.
