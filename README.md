@@ -7,11 +7,10 @@
 <br/>
 <div align="center">
     <img src="https://github.com/user-attachments/assets/a7dd1183-2bd5-4900-981e-8bd401231d7e" width="100%" style="border-radius: 5px;">
-   rgba(0, 0, 0, 0.2);">
 </div>
 <br/>
 
-## 📄 About
+## About
 
 This repository contains the source code for my Master's thesis: **"Method of UAV Control Based on Genetic Algorithms"**.
 
@@ -22,7 +21,7 @@ The project is a comprehensive **3D path planning application** featuring a real
 * **Path Smoothness** (curvature minimization)
 * **Energy Efficiency** (altitude/turn costs)
 
-## 🛠 Tech Stack
+## Tech Stack
 
 <div style="display:flex; gap:10px; flex-wrap:wrap;">
     <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" /></a>
@@ -33,7 +32,7 @@ The project is a comprehensive **3D path planning application** featuring a real
      <img src="https://github.com/user-attachments/assets/ae89ea46-81bf-40f7-b2bf-a0593b4a1549" width="100%" style="border-radius: 10px; box-shadow: 0 4px 8px 0 
 </div>
 
-## 🚀 Features
+## Features
 
 * **Multi-Strategy Optimization:** Choose between `GaLM` (Standard), `GaHM` (High Mutation), and `GaCPo` (Convergence) strategies.
 * **Interactive GUI:** Real-time parameter tuning (mutation rates, population size) without restarting the app.
@@ -43,7 +42,7 @@ The project is a comprehensive **3D path planning application** featuring a real
     * Real-time fitness & convergence graphs
 * **Export Tools:** Save calculated paths to CSV and high-res figures to PNG.
 
-## 📸 Interface & Visualization
+## Interface & Visualization
 
 ### Main Dashboard
 <img src="https://github.com/user-attachments/assets/a7dd1183-2bd5-4900-981e-8bd401231d7e" width="100%" style="border-radius: 5px;">
@@ -73,7 +72,7 @@ The project is a comprehensive **3D path planning application** featuring a real
   </tr>
 </table>
 
-## 📂 Project Structure
+## Project Structure
 
 ```bash
 ├── main.py                 # Entry point (MainWindow & Logic)
