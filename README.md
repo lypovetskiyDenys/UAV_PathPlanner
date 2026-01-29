@@ -6,7 +6,8 @@
 
 <br/>
 <div align="center">
-    <img src="https://github.com/user-attachments/assets/ae89ea46-81bf-40f7-b2bf-a0593b4a1549" width="100%" style="border-radius: 10px; box-shadow: 0 4px 8px 0 rgba(0, 0, 0, 0.2);">
+    <img src="https://github.com/user-attachments/assets/a7dd1183-2bd5-4900-981e-8bd401231d7e" width="100%" style="border-radius: 5px;">
+   rgba(0, 0, 0, 0.2);">
 </div>
 <br/>
 
@@ -29,6 +30,7 @@ The project is a comprehensive **3D path planning application** featuring a real
     <a href="https://numpy.org/"><img src="https://img.shields.io/badge/NumPy-013243?style=for-the-badge&logo=numpy&logoColor=white" alt="NumPy" /></a>
     <a href="https://scipy.org/"><img src="https://img.shields.io/badge/SciPy-8CAAE6?style=for-the-badge&logo=scipy&logoColor=white" alt="SciPy" /></a>
     <a href="https://matplotlib.org/"><img src="https://img.shields.io/badge/Matplotlib-11557C?style=for-the-badge&logo=python&logoColor=white" alt="Matplotlib" /></a>
+     <img src="https://github.com/user-attachments/assets/ae89ea46-81bf-40f7-b2bf-a0593b4a1549" width="100%" style="border-radius: 10px; box-shadow: 0 4px 8px 0 
 </div>
 
 ## 🚀 Features
